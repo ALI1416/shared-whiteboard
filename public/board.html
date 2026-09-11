@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>共享白板</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="wb-root">
+
+  <canvas id="board"></canvas>
+
+  <!-- ===== 顶部栏 ===== -->
+  <div id="topbar">
+    <div class="brand">共享白板</div>
+    <div class="room-info">房间 <b id="roomCode"></b> · <span id="roomName" title="白板名称"></span> · <span
+        id="userCount">连接中…</span></div>
+    <div id="roBadge" class="ro-badge hidden">只读</div>
+    <div class="top-actions">
+      <button id="btnUndo" title="撤销 (Ctrl+Z)">撤销</button>
+      <button id="btnRedo" title="重做 (Ctrl+Y)">重做</button>
+      <span class="sep" data-edit="1"></span>
+      <button id="btnZoomOut" title="缩小">−</button>
+      <button id="btnZoomLabel" title="缩放比例">100%</button>
+      <button id="btnZoomIn" title="放大">＋</button>
+      <button id="btnZoomFit" title="适应画布">适应</button>
+      <span class="sep" data-edit="1"></span>
+      <button id="btnCopy" data-edit="1" title="复制选中的图案 (Ctrl+C)">复制</button>
+      <button id="btnDelete" class="warning" data-edit="1" title="删除选中的图案 (Delete)">删除</button>
+      <button id="btnClearTop" class="danger" title="清空画布">清空</button>
+      <button id="btnExportImg" title="导出当前白板为图片">导出</button>
+      <span class="sep" data-edit="1"></span>
+      <button id="btnPanelTop" class="active" title="展开 / 收起属性面板">属性</button>
+      <button id="btnFullscreen" title="隐藏工具栏">隐藏工具栏</button>
+      <button id="btnBrowserFull" title="全屏 (F11)">全屏</button>
+      <span class="sep" data-edit="1"></span>
+      <button id="btnShare" class="primary">分享</button>
+      <button id="btnExit" class="danger hidden" title="退出当前白板">退出</button>
+    </div>
+  </div>
+
+  <!-- ===== 左侧工具栏 ===== -->
+  <div id="toolbar">
+    <button data-tool="hand" class="active" title="抓手：拖动画布">抓手</button>
+    <button data-tool="select" data-edit="1" title="选择：拖动/旋转/缩放">选择</button>
+    <button data-tool="pen" data-edit="1" title="画笔">画笔</button>
+    <button data-tool="line" data-edit="1" title="直线">直线</button>
+    <button data-tool="arrow" data-edit="1" title="箭头">箭头</button>
+    <button data-tool="rect" data-edit="1" title="矩形">矩形</button>
+    <button data-tool="circle" data-edit="1" title="圆形">圆形</button>
+    <button data-tool="text" data-edit="1" title="文本">文本</button>
+    <button data-tool="image" data-edit="1" title="插入图片">图片</button>
+    <button data-tool="bucket" data-edit="1" title="油漆桶：填充颜色">油漆桶</button>
+    <button data-tool="laser" title="激光笔：指点位置">激光笔</button>
+  </div>
+
+  <!-- ===== 右侧属性面板（可折叠） ===== -->
+  <div id="panel">
+    <div class="panel-head">
+      <span>属性</span>
+      <button id="btnPanelToggle" title="折叠/展开面板">收起</button>
+    </div>
+    <div id="panelBody">
+
+      <div class="panel-title">常用颜色
+        <span class="color-target" id="colorTargetCtrls">
+          <button id="btnColorStroke" class="active" title="调整描边颜色">描边</button>
+          <button id="btnColorFill" title="调整填充颜色（矩形/圆形）">填充</button>
+        </span>
+      </div>
+      <div id="palette" class="palette"></div>
+
+      <div class="panel-title">自定义颜色（RGB）</div>
+      <div class="rgb-preview-row">
+        <div id="rgbPreview" class="rgb-preview"></div>
+        <input id="rgbHexInput" type="text" maxlength="7" value="#000000" spellcheck="false" autocomplete="off" title="输入 #RRGGBB">
+      </div>
+      <div class="rgb-row">
+        <span class="rgb-key rgb-r">R</span>
+        <input id="rgbR" type="range" min="0" max="255" value="0">
+      </div>
+      <div class="rgb-row">
+        <span class="rgb-key rgb-g">G</span>
+        <input id="rgbG" type="range" min="0" max="255" value="0">
+      </div>
+      <div class="rgb-row">
+        <span class="rgb-key rgb-b">B</span>
+        <input id="rgbB" type="range" min="0" max="255" value="0">
+      </div>
+
+      <div class="panel-title">最近使用</div>
+      <div id="recentRow" class="palette recent"></div>
+
+      <div class="ctrl">
+        <div class="ctrl-label">透明度 <b id="opacityVal">100%</b></div>
+        <input id="opacityRange" type="range" min="0" max="100" value="100">
+      </div>
+
+      <div class="ctrl" id="widthCtrl">
+        <div class="ctrl-label">线宽 <b id="widthVal">4</b></div>
+        <input id="widthRange" type="range" min="1" max="40" value="4">
+      </div>
+
+      <div class="ctrl" id="fontCtrl">
+        <div class="ctrl-label">字号 <b id="fontVal">20</b></div>
+        <input id="fontRange" type="range" min="10" max="96" value="20">
+      </div>
+
+      <div class="ctrl">
+        <div class="ctrl-label">层次（选中图案后可用）</div>
+        <div class="zrow">
+          <button id="btnToFront">置顶</button>
+          <button id="btnForward">上移</button>
+        </div>
+        <div class="zrow">
+          <button id="btnToBack">置底</button>
+          <button id="btnBackward">下移</button>
+        </div>
+      </div>
+
+      <div class="ctrl">
+        <div class="ctrl-label">当前图案</div>
+        <div id="selInfo" class="sel-info">未选中</div>
+      </div>
+
+    </div>
+  </div>
+
+  <div id="statusLine"></div>
+  <div id="usersBox" class="users hidden"></div>
+  <!-- 隐藏工具栏后的右上角浮层：显示工具栏 / 全屏 两个按钮 -->
+  <div id="presentActions" class="present-actions hidden">
+    <button id="btnExitPresent" class="present-exit" title="恢复显示工具栏">显示工具栏</button>
+    <button id="btnPresentFull" class="present-exit" title="全屏">全屏</button>
+  </div>
+
+  <!-- ===== 退出白板弹窗（房主含复制链接 / 删除入口） ===== -->
+  <div id="exitModal" class="modal hidden">
+    <div class="modal-box">
+      <h3>退出白板</h3>
+      <p>退出后，该白板仍会保留在服务器上，其他人可继续使用。</p>
+      <div id="exitOwnerBox">
+        <p>退出后，该白板仍会保留在服务器上。房主链接（凭此可再次以房主身份进入）：</p>
+        <input id="ownerUrlInput" type="text" readonly>
+        <div class="modal-actions">
+          <button id="btnCopyOwnerUrl" class="primary">复制链接</button>
+          <button id="btnDeleteRoom" class="danger">删除此白板</button>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="btnExitOk" class="primary">确认退出</button>
+        <button id="btnExitCancel">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 内联文本输入（文本工具点击画布后直接输入，不弹窗） ===== -->
+  <textarea id="inlineText" class="hidden" placeholder="输入文字，点击其它位置或按 Esc 完成"></textarea>
+
+  <!-- ===== 图片插入弹窗 ===== -->
+  <div id="imgModal" class="modal hidden">
+    <div class="modal-box">
+      <h3>插入图片</h3>
+      <p>从相册选择一张图片，将自动压缩后插入画布中央。</p>
+      <input type="file" id="imgFile" accept="image/*">
+      <div class="modal-actions">
+        <button id="btnCloseImg">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 分享弹窗（分享时选择只读；导出/导入配置） ===== -->
+  <div id="shareModal" class="modal hidden">
+    <div class="modal-box">
+      <h3>分享白板</h3>
+      <p>选择访客权限，生成对应链接：</p>
+      <label class="check" id="shareModeEditRow">
+        <input type="radio" name="shareMode" id="shareModeEdit" checked>
+        <span>可编辑（访客可共同编辑）</span>
+      </label>
+      <label class="check">
+        <input type="radio" name="shareMode" id="shareModeRO">
+        <span>只读（访客只能查看）</span>
+      </label>
+      <input id="shareUrlInput" type="text" readonly>
+      <div class="config-actions">
+        <button id="btnExportCfg" title="导出当前白板的配置（JSON 文件）">导出配置</button>
+        <button id="btnImportCfg" class="hidden" title="导入配置将覆盖当前白板全部内容（仅房主）">导入配置</button>
+        <input type="file" id="importFile" accept=".json,application/json" class="hidden">
+      </div>
+      <div class="modal-actions">
+        <button id="btnCopyUrl" class="primary">复制链接</button>
+        <button id="btnCloseShare">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 房间设置弹窗（房主：改名 + 修改访问密码） ===== -->
+  <div id="roomModal" class="modal hidden">
+    <div class="modal-box">
+      <h3>房间设置</h3>
+      <label class="field">白板名称
+        <input id="roomNameInput" type="text" maxlength="40">
+      </label>
+      <label class="field">访问密码（留空表示无需密码）
+        <input id="roomPwdInput" type="text" maxlength="40" placeholder="修改后，新加入者需使用新密码">
+      </label>
+      <div class="modal-actions">
+        <button id="btnRoomOk" class="primary">确定</button>
+        <button id="btnRoomCancel">取消</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script src="js/board.js"></script>
+</body>
+</html>

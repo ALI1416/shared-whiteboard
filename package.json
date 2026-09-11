@@ -1,0 +1,19 @@
+{
+  "name": "shared-whiteboard",
+  "version": "1.0.0",
+  "description": "iOS9 兼容的共享白板（HTML5 + Node.js，房间数据全部缓存在内存）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/ws-test.js && node test/client-e2e.js"
+  },
+  "engines": {
+    "node": ">=12"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "jsdom": "^30.0.1"
+  }
+}

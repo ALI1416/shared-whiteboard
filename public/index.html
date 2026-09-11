@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>共享白板 - 创建 / 加入</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body class="join-body">
+<div class="join-wrap">
+  <div class="join-head">
+    <h1>共享白板</h1>
+    <p>多端实时协作 · 支持 iOS 9 及以上</p>
+  </div>
+
+  <div class="join-cards">
+
+    <div class="join-card">
+      <h2>创建白板</h2>
+      <label>白板名称（可选）
+        <input id="cName" type="text" maxlength="40" placeholder="例如：产品评审会">
+      </label>
+      <label>房间号（可选，留空自动生成）
+        <input id="cRoom" type="text" maxlength="10" placeholder="仅大写字母和数字，1-10 位">
+      </label>
+      <label>访问密码（可选）
+        <input id="cPwd" type="text" maxlength="40" placeholder="留空则无需密码">
+      </label>
+      <button id="btnCreate" class="primary">创建并进入</button>
+      <div id="createMsg" class="msg"></div>
+    </div>
+
+    <div class="join-card">
+      <h2>加入白板</h2>
+      <label>昵称（可选）
+        <input id="jName" type="text" maxlength="20" placeholder="默认：访客xxxx">
+      </label>
+      <label>房间号
+        <input id="jRoom" type="text" maxlength="5" placeholder="5 位房间号，如 AB3K7">
+      </label>
+      <label>访问密码（可选）
+        <input id="jPwd" type="text" maxlength="40" placeholder="创建者设置的密码">
+      </label>
+      <button id="btnJoin" class="primary">加入</button>
+      <div id="joinMsg" class="msg"></div>
+    </div>
+
+  </div>
+  <p class="join-foot">数据保存在服务器内存中，服务器重启后房间将清空。</p>
+  <p class="join-foot"><a href="admin" id="adminLink" class="admin-link">管理员登录</a></p>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  function $(id) { return document.getElementById(id); }
+  function msg(el, text, ok) {
+    el.textContent = text || '';
+    el.className = 'msg' + (ok ? ' ok' : ' err');
+  }
+  function xhrPost(path, data, cb) {
+    var x = new XMLHttpRequest();
+    x.open('POST', path, true);
+    x.setRequestHeader('Content-Type', 'application/json');
+    x.onreadystatechange = function () {
+      if (x.readyState === 4) cb(x.status, x.responseText);
+    };
+    x.send(JSON.stringify(data));
+  }
+  function xhrGet(path, cb) {
+    var x = new XMLHttpRequest();
+    x.open('GET', path, true);
+    x.onreadystatechange = function () {
+      if (x.readyState === 4) cb(x.status, x.responseText);
+    };
+    x.send(null);
+  }
+  function esc(s) { return encodeURIComponent(s || ''); }
+
+  $('btnCreate').addEventListener('click', function () {
+    var name = $('cName').value;
+    var pwd = $('cPwd').value;
+    var roomId = $('cRoom').value.trim().toUpperCase();
+    msg($('createMsg'), '正在创建…');
+    xhrPost('/api/create', { name: name, pwd: pwd, roomId: roomId }, function (status, text) {
+      var r = {};
+      try { r = JSON.parse(text); } catch (e) {}
+      if (status === 200 && r.ok) {
+        location.href = 'board.html?room=' + esc(r.id) + '&key=' + esc(r.ownerKey) + '&name=' + esc(name || '');
+      } else {
+        msg($('createMsg'), '创建失败：' + (r.error || '网络错误'));
+      }
+    });
+  });
+
+  $('cRoom').addEventListener('input', function () {
+    this.value = this.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10);
+  });
+
+  $('btnJoin').addEventListener('click', function () {
+    var room = $('jRoom').value.trim().toUpperCase();
+    var pwd = $('jPwd').value;
+    var name = $('jName').value;
+    if (!room) { msg($('joinMsg'), '请填写房间号'); return; }
+    msg($('joinMsg'), '正在加入…');
+    // 加入前先预检：房间不存在或密码错误直接提示，不进入白板页面
+    xhrGet('/api/room?id=' + encodeURIComponent(room) + '&pwd=' + encodeURIComponent(pwd), function (status, text) {
+      var r = {};
+      try { r = JSON.parse(text); } catch (e) {}
+      if (status !== 200 || !r.ok) {
+        msg($('joinMsg'), '网络错误，请重试');
+        return;
+      }
+      if (!r.exists) {
+        msg($('joinMsg'), '房间 ' + room + ' 不存在，请检查房间号');
+        return;
+      }
+      if (!r.pwdOk) {
+        msg($('joinMsg'), '房间密码错误，请重新输入');
+        return;
+      }
+      location.href = 'board.html?room=' + esc(room) + '&pwd=' + esc(pwd) + '&name=' + esc(name);
+    });
+  });
+
+  $('jRoom').addEventListener('input', function () {
+    this.value = this.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 5);
+  });
+})();
+</script>
+</body>
+</html>

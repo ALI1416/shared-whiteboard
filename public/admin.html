@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>共享白板 - 管理员控制台</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body class="admin-page">
+<div class="admin-head">
+  <h1>共享白板 · 管理员控制台</h1>
+  <div class="admin-head-links">
+    <a href="/">返回首页</a>
+    <button id="btnLogout" class="danger">退出登录</button>
+  </div>
+</div>
+
+<div class="admin-wrap">
+  <div id="status" class="admin-status">加载中…</div>
+  <div class="admin-toolbar" id="toolbarRow">
+    <span style="font-size:13px;color:#64748b">共 <b id="roomTotal">0</b> 个白板</span>
+    <div class="row-right">
+      <button id="btnDeleteAll" class="danger">删除全部白板</button>
+      <button id="btnRefresh">刷新</button>
+    </div>
+  </div>
+  <table id="roomTable" class="admin-table" style="display:none">
+    <thead>
+      <tr>
+        <th>房间号</th><th>名称</th><th>在线人数</th><th>元素数</th><th>密码</th><th>最后修改</th><th>创建时间</th><th>操作</th>
+      </tr>
+    </thead>
+    <tbody id="roomBody"></tbody>
+  </table>
+  <div id="emptyTip" class="admin-empty" style="display:none">当前没有任何白板</div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  function $(id) { return document.getElementById(id); }
+  function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function fmtTime(t) {
+    var d = new Date(t);
+    function p(n) { return n < 10 ? '0' + n : n; }
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+  function setStatus(text, cls) {
+    var s = $('status');
+    s.textContent = text;
+    s.className = 'admin-status' + (cls ? ' ' + cls : '');
+  }
+  function xhr(method, path, body, cb) {
+    var x = new XMLHttpRequest();
+    x.open(method, path, true);
+    x.setRequestHeader('Content-Type', 'application/json');
+    x.onreadystatechange = function () {
+      if (x.readyState === 4) {
+        var data = {};
+        try { data = JSON.parse(x.responseText || '{}'); } catch (e) {}
+        cb(x.status, data);
+      }
+    };
+    x.send(body ? JSON.stringify(body) : null);
+  }
+
+  function hideAllFeatures() {
+    // 未配置管理员：隐藏全部可操作功能，只保留提示
+    $('toolbarRow').style.display = 'none';
+    $('btnLogout').style.display = 'none';
+    $('roomTable').style.display = 'none';
+    $('emptyTip').style.display = 'none';
+  }
+
+  function loadRooms() {
+    setStatus('加载中…');
+    xhr('GET', '/api/admin/rooms', null, function (status, data) {
+      if (status === 503) {
+        hideAllFeatures();
+        setStatus('管理员账号未配置：请在启动参数中配置 --admin-user 与 --admin-pass（或环境变量 ADMIN_USER / ADMIN_PASS）后重启服务器。', 'err');
+        return;
+      }
+      if (status === 401) {
+        setStatus('认证失败：请使用管理员账号登录（浏览器会弹出登录框，或在地址栏输入 http://用户名:密码@地址/admin）', 'err');
+        $('roomTable').style.display = 'none';
+        $('emptyTip').style.display = 'none';
+        return;
+      }
+      if (status !== 200 || (data && data.error)) {
+        setStatus('无法加载：' + (data.error || ('HTTP ' + status)), 'err');
+        $('roomTable').style.display = 'none';
+        $('emptyTip').style.display = 'none';
+        return;
+      }
+      var rooms = data.rooms || [];
+      window.__rooms = rooms; // 缓存（含 ownerKey），用于「以房主进入」
+      $('roomTotal').textContent = rooms.length;
+      var body = $('roomBody');
+      body.innerHTML = '';
+      if (!rooms.length) {
+        $('roomTable').style.display = 'none';
+        $('emptyTip').style.display = 'block';
+        setStatus('加载完成', 'ok');
+        return;
+      }
+      for (var i = 0; i < rooms.length; i++) {
+        var r = rooms[i];
+        var tr = document.createElement('tr');
+        var pwdTag = r.hasPwd ? '<span class="admin-tag pwd">有</span>' : '<span class="admin-tag">无</span>';
+        tr.innerHTML =
+          '<td><b>' + esc(r.id) + '</b></td>' +
+          '<td>' + esc(r.name) + '</td>' +
+          '<td class="num">' + r.userCount + '</td>' +
+          '<td class="num">' + r.elementCount + '</td>' +
+          '<td>' + pwdTag + '</td>' +
+          '<td>' + (r.userCount > 0 ? '<span class="admin-tag pwd">现在</span>' : fmtTime(r.lastModified || r.lastActive)) + '</td>' +
+          '<td>' + fmtTime(r.createdAt) + '</td>' +
+          '<td class="admin-ops">' +
+          '  <button class="enter" data-enter="' + esc(r.id) + '">进入</button>' +
+          '  <button class="del" data-del="' + esc(r.id) + '">删除</button>' +
+          '</td>';
+        body.appendChild(tr);
+      }
+      $('roomTable').style.display = '';
+      $('emptyTip').style.display = 'none';
+      setStatus('加载完成', 'ok');
+    });
+  }
+
+  // 伪装成房主进入：admin 持 ownerKey，直接拼创建者链接（新窗口打开）
+  document.addEventListener('click', function (e) {
+    var t = e.target;
+    while (t && t !== document) {
+      if (t.getAttribute && t.getAttribute('data-enter')) {
+        var id = t.getAttribute('data-enter');
+        var rooms = window.__rooms || [];
+        var hit = null;
+        for (var i = 0; i < rooms.length; i++) { if (rooms[i].id === id) { hit = rooms[i]; break; } }
+        if (hit) {
+          // 进入时名字留空：服务端会按房主（owner）强制显示「房主」，无需也不应带 name 参数
+          window.open('board.html?room=' + encodeURIComponent(hit.id) + '&key=' + encodeURIComponent(hit.ownerKey), '_blank');
+        } else {
+          setStatus('未找到该白板，请刷新列表', 'err');
+        }
+        return;
+      }
+      if (t.getAttribute && t.getAttribute('data-del')) {
+        var did = t.getAttribute('data-del');
+        if (confirm('确定删除白板 ' + did + '？将断开所有成员且无法恢复。')) {
+          xhr('POST', '/api/admin/delete_room', { id: did }, function (status, data) {
+            if (status === 401) { setStatus('认证失败或已过期，请刷新页面重新登录', 'err'); return; }
+            if (status !== 200 || !data.ok) { setStatus('删除失败：' + (data.error || ('HTTP ' + status)), 'err'); return; }
+            setStatus('已删除白板 ' + did, 'ok');
+            loadRooms();
+          });
+        }
+        return;
+      }
+      t = t.parentNode;
+    }
+  }, false);
+
+  $('btnRefresh').addEventListener('click', function () { location.reload(); });
+  // 退出登录：用错误凭据请求管理接口触发 401，覆盖浏览器缓存的 Basic 凭据，
+  // 再跳转到干净 URL——不用 logout:logout@ 跳转，避免地址栏残留错误凭据导致无法再次登录
+  $('btnLogout').addEventListener('click', function () {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/api/admin/rooms', true, 'logout', 'logout');
+    x.onreadystatechange = function () {
+      if (x.readyState === 4) {
+        try { location.href = '/'; } catch (e) {}
+      }
+    };
+    x.send(null);
+  });
+  $('btnDeleteAll').addEventListener('click', function () {
+    if (!confirm('确定删除服务器上的全部白板？所有房间将消失且无法恢复！')) return;
+    if (!confirm('再次确认：此操作不可撤销，将删除全部白板。')) return;
+    xhr('POST', '/api/admin/delete_all', {}, function (status, data) {
+      if (status === 401) { setStatus('认证失败或已过期，请刷新页面重新登录', 'err'); return; }
+      if (status !== 200 || !data.ok) { setStatus('删除失败：' + (data.error || ('HTTP ' + status)), 'err'); return; }
+      setStatus('已删除全部 ' + data.deleted + ' 个白板', 'ok');
+      loadRooms();
+    });
+  });
+
+  loadRooms();
+})();
+</script>
+</body>
+</html>
