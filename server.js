@@ -4,53 +4,53 @@
  * - 静态文件服务（public/ 目录）
  * - REST：POST /api/create 创建房间（名称 / 密码），GET /api/room 加入预检，
  *        /api/admin/* 管理员接口（列表 / 伪装进入 / 删除）
- * - WebSocket /ws：房间内协同（增删改、撤销重做、层次、激光笔、在线用户）
- * - 房间数据（元素、撤销栈、用户）全部缓存在进程内存，进程重启即清空
+ * - WebSocket /ws：房间内协同（增删改、撤销重做、层次、激光笔、在线用户、房间设置）
+ * - 房间数据（元素、操作时间线、用户、图片池）全部缓存在进程内存，进程重启即清空
  * ============================================================ */
-var http = require('http');
-var fs = require('fs');
-var path = require('path');
-var url = require('url');
-var crypto = require('crypto');
-var WebSocketServer = require('ws').Server;
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const url = require('url');
+const crypto = require('crypto');
+const WebSocketServer = require('ws').Server;
 
-var PORT = Number(process.env.PORT) || 8080;
-var PUBLIC_DIR = path.join(__dirname, 'public');
-var MAX_BODY = 1024 * 1024;           // REST 请求体上限 1MB
-var MAX_MSG = 4 * 1024 * 1024;        // WS 单条消息上限 4MB
-var UNDO_DEPTH = 100;                 // 每个房间撤销深度
-var MAX_ELEMENTS = 5000;              // 每房间元素上限
-var ROOM_TTL_EMPTY_MS = 60 * 60 * 1000;             // 空白板（无元素）无访问 1 小时自动回收
-var ROOM_TTL_CONTENT_MS = 7 * 24 * 60 * 60 * 1000;  // 有内容白板无访问或修改 7 天自动回收
+const PORT = Number(process.env.PORT) || 8080;
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const MAX_BODY = 1024 * 1024;           // REST 请求体上限 1MB
+const MAX_MSG = 4 * 1024 * 1024;        // WS 单条消息上限 4MB
+const UNDO_DEPTH = 100;                 // 每个房间撤销深度
+const MAX_ELEMENTS = 5000;              // 每房间元素上限
+const ROOM_TTL_EMPTY_MS = 60 * 60 * 1000;             // 空白板（无元素）无访问 1 小时自动回收
+const ROOM_TTL_CONTENT_MS = 7 * 24 * 60 * 60 * 1000;  // 有内容白板无访问或修改 7 天自动回收
 
 /* ---------------- 管理员账号（启动参数配置） ----------------
  * 支持环境变量 ADMIN_USER / ADMIN_PASS，或命令行参数
  *   node server.js --admin-user=admin --admin-pass=secret
  * 两者都配置后才启用 /admin 管理页面与 /api/admin/* 接口。 */
 function getArg(name) {
-  var prefix = '--' + name + '=';
-  for (var i = 2; i < process.argv.length; i++) {
+  const prefix = '--' + name + '=';
+  for (let i = 2; i < process.argv.length; i++) {
     if (process.argv[i].indexOf(prefix) === 0) return process.argv[i].slice(prefix.length);
   }
   return '';
 }
-var ADMIN_USER = process.env.ADMIN_USER || getArg('admin-user') || '';
-var ADMIN_PASS = process.env.ADMIN_PASS || getArg('admin-pass') || '';
-var ADMIN_ENABLED = !!(ADMIN_USER && ADMIN_PASS);
+const ADMIN_USER = process.env.ADMIN_USER || getArg('admin-user') || '';
+const ADMIN_PASS = process.env.ADMIN_PASS || getArg('admin-pass') || '';
+const ADMIN_ENABLED = !!(ADMIN_USER && ADMIN_PASS);
 
 /* HTTP Basic 认证校验（常量时间比较，防时序攻击） */
 function basicAuthOk(req) {
   if (!ADMIN_ENABLED) return false;
-  var h = req.headers.authorization || '';
+  const h = req.headers.authorization || '';
   if (h.indexOf('Basic ') !== 0) return false;
-  var dec;
+  let dec;
   try { dec = Buffer.from(h.slice(6), 'base64').toString('utf8'); } catch (e) { return false; }
-  var i = dec.indexOf(':');
+  const i = dec.indexOf(':');
   if (i < 0) return false;
   return constEq(dec.slice(0, i), ADMIN_USER) && constEq(dec.slice(i + 1), ADMIN_PASS);
 }
 function constEq(a, b) {
-  var ba = Buffer.from(String(a)), bb = Buffer.from(String(b));
+  const ba = Buffer.from(String(a)), bb = Buffer.from(String(b));
   if (ba.length !== bb.length) return false;
   return crypto.timingSafeEqual(ba, bb);
 }
@@ -59,7 +59,7 @@ function needAuth(res) {
   res.end('需要管理员认证');
 }
 
-var MIME = {
+const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.js': 'application/javascript; charset=utf-8',
@@ -73,35 +73,39 @@ var MIME = {
   '.txt': 'text/plain; charset=utf-8'
 };
 
-var rooms = Object.create(null); // roomId -> room
+const rooms = Object.create(null); // roomId -> room
 
 /* ---------------- 小工具 ---------------- */
 function randId(len, chars) {
-  var s = '';
-  for (var i = 0; i < len; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
+  let s = '';
+  for (let i = 0; i < len; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
   return s;
 }
 function roomId() {
-  var chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 去除易混淆字符
-  var id;
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 去除易混淆字符
+  let id;
   do { id = randId(5, chars); } while (rooms[id]);
   return id;
 }
 function now() { return Date.now(); }
 function isNum(v) { return typeof v === 'number' && isFinite(v); }
 
-var USER_COLORS = ['#E53935', '#FB8C00', '#FDD835', '#43A047', '#00897B', '#1E88E5', '#8E24AA', '#F06292', '#6D4C41', '#616161'];
+const USER_COLORS = ['#E53935', '#FB8C00', '#FDD835', '#43A047', '#00897B', '#1E88E5', '#8E24AA', '#F06292', '#6D4C41', '#616161'];
 
 function createRoom(name, pwd, rid) {
-  var id = rid || roomId();
-  var room = {
-    id: id,
+  const id = rid || roomId();
+  const room = {
+    id,
     name: String(name || '').slice(0, 40) || ('白板 ' + id),
     pwd: String(pwd || '').slice(0, 40),
     ownerKey: randId(14, 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'),
     elements: [],
-    undo: [],
-    redo: [],
+    images: [],            // 图片数据池 {id, src}：元素仅存 imageId 引用，复制不重复存储
+    history: [],           // 操作时间线（PS 式单条时间线：操作记录，非全量快照）
+    historyIndex: -1,      // 时间线指针：指向最后一条已应用操作（-1 = 初始空白状态）
+    noLaserRO: false,      // 房间设置：只读用户禁用激光笔
+    forceRO: false,        // 房间设置：可编辑用户禁止编辑（降级为只读）
+    livePending: Object.create(null), // id -> true：live 创建尚未 commit 的元素（时间线 add 语义区分）
     clients: Object.create(null),
     createdAt: now(),
     lastActive: now(),
@@ -113,17 +117,19 @@ function createRoom(name, pwd, rid) {
 }
 
 function shareUrl(req, room) {
-  var host = req.headers.host || ('localhost:' + PORT);
-  var q = 'room=' + encodeURIComponent(room.id);
-  if (room.pwd) q += '&pwd=' + encodeURIComponent(room.pwd);
-  return 'http://' + host + '/board.html?' + q;
+  const host = req.headers.host || (`localhost:${PORT}`);
+  // 协议动态判定：支持 https 反代（x-forwarded-proto）与直连 TLS
+  const proto = (req.connection && req.connection.encrypted) || (req.headers['x-forwarded-proto'] || '').indexOf('https') === 0 ? 'https' : 'http';
+  let q = `room=${encodeURIComponent(room.id)}`;
+  if (room.pwd) q += `&pwd=${encodeURIComponent(room.pwd)}`;
+  return `${proto}://${host}/board.html?${q}`;
 }
 
 /* 管理员：房间列表（含 ownerKey，用于伪装成房主进入） */
 function adminRoomList() {
-  var arr = [];
-  Object.keys(rooms).forEach(function (id) {
-    var r = rooms[id];
+  const arr = [];
+  Object.keys(rooms).forEach((id) => {
+    const r = rooms[id];
     if (!r || r.deleted) return;
     arr.push({
       id: r.id,
@@ -137,7 +143,7 @@ function adminRoomList() {
       ownerKey: r.ownerKey
     });
   });
-  arr.sort(function (a, b) { return b.createdAt - a.createdAt; });
+  arr.sort((a, b) => b.createdAt - a.createdAt);
   return arr;
 }
 
@@ -147,51 +153,107 @@ function adminDisabled(res) {
 }
 
 function listUsers(room) {
-  var arr = [];
-  Object.keys(room.clients).forEach(function (uid) {
-    var c = room.clients[uid];
-    arr.push({ uid: uid, name: c.name, color: c.color, readonly: c.readonly, owner: c.owner });
+  const arr = [];
+  Object.keys(room.clients).forEach((uid) => {
+    const c = room.clients[uid];
+    arr.push({ uid, name: c.name, color: c.color, readonly: c.readonly, owner: c.owner });
   });
   return arr;
 }
 
-function pushHistory(room) {
-  room.undo.push(JSON.stringify(room.elements));
-  if (room.undo.length > UNDO_DEPTH) room.undo.shift();
-  room.redo.length = 0;
+/* ---------------- 操作时间线（PS 式：一条时间线，服务端/客户端同一模型） ----------------
+ * 每条历史记录是一个操作：{t:'add',el,i} 添加 / {t:'upd',id,before,after} 更新 /
+ * {t:'del',el,i} 删除 / {t:'clear',els} 清空 / {t:'ord',id,from,to} 重排。
+ * 撤销 = 逆应用指针处操作并回退；重做 = 前进并正应用；新操作截断未来。 */
+function pushHistoryOp(room, op) {
+  if (room.historyIndex < room.history.length - 1) room.history.length = room.historyIndex + 1; // 新操作截断未来
+  room.history.push(op);
+  room.historyIndex++;
+  if (room.history.length > UNDO_DEPTH) {
+    room.history.shift();
+    room.historyIndex--;
+  }
+}
+
+function applyHistoryOp(room, op, inverse) {
+  if (op.t === 'add') {
+    if (inverse) {
+      const idx = findIndexById(room, op.el.id);
+      if (idx >= 0) room.elements.splice(idx, 1);
+    } else if (findIndexById(room, op.el.id) < 0) {
+      const at = Math.max(0, Math.min(op.i, room.elements.length));
+      room.elements.splice(at, 0, op.el);
+    }
+  } else if (op.t === 'del') {
+    if (inverse) {
+      if (findIndexById(room, op.el.id) < 0) {
+        const at = Math.max(0, Math.min(op.i, room.elements.length));
+        room.elements.splice(at, 0, op.el);
+      }
+    } else {
+      const idx = findIndexById(room, op.el.id);
+      if (idx >= 0) room.elements.splice(idx, 1);
+    }
+  } else if (op.t === 'upd') {
+    const idx = findIndexById(room, op.id);
+    if (idx >= 0) {
+      const snap = inverse ? op.before : op.after;
+      Object.keys(snap).forEach((k) => { room.elements[idx][k] = snap[k]; });
+    }
+  } else if (op.t === 'clear') {
+    if (inverse) room.elements = JSON.parse(JSON.stringify(op.els));
+    else room.elements = [];
+  } else if (op.t === 'ord') {
+    const idx = findIndexById(room, op.id);
+    if (idx < 0) return;
+    const el = room.elements.splice(idx, 1)[0];
+    let to = inverse ? op.from : op.to;
+    to = Math.max(0, Math.min(to, room.elements.length));
+    room.elements.splice(to, 0, el);
+  }
+}
+
+/* 撤销/重做可用状态轻量广播（供客户端按钮 disabled 状态刷新） */
+function broadcastHistory(room) {
+  broadcast(room, { type: 'history', undoable: room.historyIndex >= 0, redoable: room.historyIndex < room.history.length - 1 });
 }
 
 function findIndexById(room, id) {
-  for (var i = 0; i < room.elements.length; i++) {
+  for (let i = 0; i < room.elements.length; i++) {
     if (room.elements[i].id === id) return i;
   }
   return -1;
 }
 
 function broadcast(room, msg, exceptUid) {
-  var data = JSON.stringify(msg);
-  Object.keys(room.clients).forEach(function (uid) {
+  const data = JSON.stringify(msg);
+  Object.keys(room.clients).forEach((uid) => {
     if (uid === exceptUid) return;
-    var c = room.clients[uid];
+    const c = room.clients[uid];
     if (c.ws && c.ws.readyState === 1) {
       try { c.ws.send(data); } catch (e) {}
     }
   });
 }
 
-function broadcastState(room) {
-  var msg = {
+function broadcastState(room, exceptUid) {
+  const msg = {
     type: 'state',
     elements: room.elements,
-    undoable: room.undo.length > 0,
-    redoable: room.redo.length > 0
+    images: room.images,
+    history: room.history,          // 操作时间线（PS 式：操作记录数组，非全量快照）
+    historyIndex: room.historyIndex,
+    undoable: room.historyIndex >= 0,
+    redoable: room.historyIndex < room.history.length - 1
   };
-  broadcast(room, msg); // 撤销/重做需要通知所有客户端（含发起者）
+  // 撤销/重做后的校正广播：操作人本地已立即执行（无需校正），只发给其他成员；
+  // 导入等其它 state 场景传 undefined，通知所有客户端（含发起者）
+  broadcast(room, msg, exceptUid);
 }
 
 /* ---------------- 元素校验 ---------------- */
-var ELEMENT_TYPES = { pen: 1, line: 1, arrow: 1, rect: 1, circle: 1, text: 1, image: 1 };
-var PATCH_KEYS = {
+const ELEMENT_TYPES = { pen: 1, line: 1, arrow: 1, rect: 1, circle: 1, text: 1, image: 1 };
+const PATCH_KEYS = {
   x: 1, y: 1, w: 1, h: 1, x1: 1, y1: 1, x2: 1, y2: 1,
   rotation: 1, points: 1, text: 1,
   stroke: 1, fill: 1, opacity: 1, strokeWidth: 1, fontSize: 1
@@ -203,14 +265,17 @@ function validElement(el) {
   if (!ELEMENT_TYPES[el.type]) return false;
   if (el.type === 'pen') {
     if (!Array.isArray(el.points) || el.points.length < 1 || el.points.length > 5000) return false;
-    for (var i = 0; i < el.points.length; i++) {
-      var p = el.points[i];
+    for (let i = 0; i < el.points.length; i++) {
+      const p = el.points[i];
       if (!Array.isArray(p) || p.length < 2 || !isNum(p[0]) || !isNum(p[1])) return false;
     }
   } else if (el.type === 'text') {
     if (typeof el.text !== 'string' || el.text.length > 5000) return false;
   } else if (el.type === 'image') {
-    if (typeof el.src !== 'string' || el.src.length > 2500000) return false;
+    // 图片元素只存 imageId 引用；兼容旧格式（带 src 无 imageId），由 attachImage 归一化
+    const hasImgId = typeof el.imageId === 'string' && el.imageId && el.imageId.length <= 40;
+    const hasSrc = typeof el.src === 'string' && el.src.length > 0 && el.src.length <= 2500000;
+    if (!hasImgId && !hasSrc) return false;
   }
   if (el.opacity !== undefined && (!isNum(el.opacity) || el.opacity < 0 || el.opacity > 1)) return false;
   if (el.strokeWidth !== undefined && (!isNum(el.strokeWidth) || el.strokeWidth < 0.5 || el.strokeWidth > 200)) return false;
@@ -219,16 +284,41 @@ function validElement(el) {
   return true;
 }
 
+/* 图片元素归一化：把 src 存入房间图片池（按 imageId 去重），元素只保留 imageId 引用；
+ * 复制图片时 imageId 已存在，直接复用，不再重复存储图片数据。 */
+function attachImage(room, el) {
+  if (el.type !== 'image') return el;
+  let imgId = el.imageId;
+  if (imgId) {
+    for (let i = 0; i < room.images.length; i++) {
+      if (room.images[i].id === imgId) {
+        const out = Object.assign({}, el);
+        delete out.src;
+        return out; // 图片池已有该图：去重
+      }
+    }
+  } else {
+    imgId = el.id;
+  }
+  if (typeof el.src !== 'string' || !el.src) return null; // 新图片必须携带数据
+  room.images.push({ id: imgId, src: el.src });
+  broadcast(room, { type: 'image_added', image: { id: imgId, src: el.src } });
+  const out = Object.assign({}, el);
+  out.imageId = imgId;
+  delete out.src;
+  return out;
+}
+
 function sanitizePatch(patch) {
-  var out = {};
+  const out = {};
   if (!patch || typeof patch !== 'object') return out;
-  Object.keys(patch).forEach(function (k) {
+  Object.keys(patch).forEach((k) => {
     if (!PATCH_KEYS[k]) return;
-    var v = patch[k];
+    const v = patch[k];
     if (k === 'points') {
       if (!Array.isArray(v) || v.length > 5000) return;
-      for (var i = 0; i < v.length; i++) {
-        var p = v[i];
+      for (let i = 0; i < v.length; i++) {
+        const p = v[i];
         if (!Array.isArray(p) || p.length < 2 || !isNum(p[0]) || !isNum(p[1])) return;
       }
       out[k] = v;
@@ -252,27 +342,15 @@ function sanitizePatch(patch) {
 }
 
 /* ---------------- 层次调整 ---------------- */
-function reorderElement(room, id, action) {
-  var idx = findIndexById(room, id);
-  if (idx < 0) return false;
-  var el = room.elements.splice(idx, 1)[0];
-  var ni = idx;
-  if (action === 'toFront') ni = room.elements.length;
-  else if (action === 'toBack') ni = 0;
-  else if (action === 'forward') ni = Math.min(room.elements.length, idx + 1);
-  else if (action === 'backward') ni = Math.max(0, idx - 1);
-  else { room.elements.splice(idx, 0, el); return false; }
-  room.elements.splice(ni, 0, el);
-  return true;
-}
+/* 注：层次调整已内联到消息处理（reorder 分支），以便记录 {t:'ord'} 时间线操作的 from/to */
 
 /* 删除整个白板：清空内存房间数据、断开所有成员（创建者按钮与管理端共用） */
 function deleteRoom(room) {
   room.deleted = true;
   broadcast(room, { type: 'room_deleted' }); // 通知所有成员（含发起者）
   delete rooms[room.id];
-  Object.keys(room.clients).forEach(function (uid) {
-    var c = room.clients[uid];
+  Object.keys(room.clients).forEach((uid) => {
+    const c = room.clients[uid];
     if (c.ws && c.ws.readyState === 1) {
       try { c.ws.close(); } catch (e) {}
     }
@@ -286,19 +364,21 @@ function handleMessage(room, client, msg) {
 
   if (msg.type === 'ping') { sendRaw(client, { type: 'pong' }); return; }
 
-  // 激光笔：所有人（含发起者）都能看到轨迹
+  // 激光笔：轨迹广播给其他成员；发起者本地自行渲染（不回传自身，避免重复绘制）。
+  // 房间设置「只读用户禁用激光笔」（client.noLaser）时，激光消息一律忽略
   if (msg.type === 'laser') {
-    var x = isNum(msg.x) ? msg.x : 0;
-    var y = isNum(msg.y) ? msg.y : 0;
-    broadcast(room, { type: 'laser', uid: client.uid, x: x, y: y, active: !!msg.active });
+    if (client.noLaser) return;
+    const x = isNum(msg.x) ? msg.x : 0;
+    const y = isNum(msg.y) ? msg.y : 0;
+    broadcast(room, { type: 'laser', uid: client.uid, x, y, active: !!msg.active }, client.uid);
     return;
   }
 
   // 选中状态广播：让其他成员看到谁在编辑哪些图案（只读成员也可选看；支持多选 ids）
   if (msg.type === 'sel') {
-    var selIds = [];
+    const selIds = [];
     if (Array.isArray(msg.ids)) {
-      for (var si = 0; si < msg.ids.length && si < 200; si++) {
+      for (let si = 0; si < msg.ids.length && si < 200; si++) {
         if (typeof msg.ids[si] === 'string' && msg.ids[si].length <= 40 && selIds.indexOf(msg.ids[si]) < 0) selIds.push(msg.ids[si]);
       }
     } else if (typeof msg.id === 'string' && msg.id.length <= 40) {
@@ -311,7 +391,7 @@ function handleMessage(room, client, msg) {
   // 创建者重命名白板
   if (msg.type === 'rename') {
     if (!client.owner) return;
-    var nm = String(msg.name || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+    const nm = String(msg.name || '').replace(/\s+/g, ' ').trim().slice(0, 40);
     if (!nm) return;
     room.name = nm;
     broadcast(room, { type: 'room_renamed', name: nm }); // 含发起者
@@ -321,7 +401,7 @@ function handleMessage(room, client, msg) {
   // 房主修改访问密码（留空表示取消密码）
   if (msg.type === 'pwd_change') {
     if (!client.owner) return;
-    var np = String(msg.pwd || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+    const np = String(msg.pwd || '').replace(/\s+/g, ' ').trim().slice(0, 40);
     if (np === room.pwd) return;
     room.pwd = np;
     room.lastModified = now();
@@ -329,29 +409,94 @@ function handleMessage(room, client, msg) {
     // 设置 / 更换密码：旧密码失效，强制断开所有非房主成员，提示重新输入密码加入；
     // 清空密码（取消密码）后无需密码即可加入，不踢人
     if (np) {
-      Object.keys(room.clients).forEach(function (uid) {
-        var c = room.clients[uid];
+      Object.keys(room.clients).forEach((uid) => {
+        const c = room.clients[uid];
         if (!c || c.owner) return;
         if (c.ws && c.ws.readyState === 1) {
           try { c.ws.send(JSON.stringify({ type: 'pwd_kicked', reason: '访问密码已更改，请重新输入密码加入' })); } catch (e) {}
-          setTimeout(function () { try { c.ws.close(); } catch (e) {} }, 200);
+          setTimeout(() => { try { c.ws.close(); } catch (e) {} }, 200);
         }
       });
     }
     return;
   }
 
-  // 房主导入配置：全量替换白板内容（覆盖当前元素并清空撤销历史）
+  // 房间设置（房主）：只读用户禁用激光笔 / 可编辑用户禁止编辑——对在线成员即时生效
+  if (msg.type === 'room_settings') {
+    if (!client.owner) return;
+    const noLaserRO = !!msg.noLaserRO;
+    const forceRO = !!msg.forceRO;
+    let changed = false;
+    if (noLaserRO !== room.noLaserRO) {
+      room.noLaserRO = noLaserRO;
+      changed = true;
+      // 同步更新所有在线只读成员的激光权限，并广播通知（含发起者）
+      Object.keys(room.clients).forEach((uid) => {
+        const c = room.clients[uid];
+        if (c && !c.owner) c.noLaser = c.readonly && noLaserRO;
+      });
+      broadcast(room, { type: 'room_laser_policy', noLaserRO });
+    }
+    if (forceRO !== room.forceRO) {
+      room.forceRO = forceRO;
+      changed = true;
+      // 开启：在线可编辑访客降级为只读（清理进行中的 live 创建）；关闭：按基础权限恢复；
+      // 均同步重算激光权限并广播通知（含发起者）
+      Object.keys(room.clients).forEach((uid) => {
+        const c = room.clients[uid];
+        if (!c || c.owner) return;
+        c.readonly = c.baseReadonly || forceRO;
+        c.noLaser = c.readonly && room.noLaserRO;
+        if (forceRO && c._live) delete c._live;
+      });
+      broadcast(room, { type: 'room_edit_policy', forceRO });
+    }
+    if (changed) {
+      room.lastModified = now();
+    }
+    return;
+  }
+
+  // 房主导入配置：全量替换白板内容（覆盖当前元素与图片池并清空撤销历史）
   if (msg.type === 'import') {
     if (!client.owner) return;
     if (!Array.isArray(msg.elements) || msg.elements.length > MAX_ELEMENTS) return;
-    var clean = [];
-    for (var ei = 0; ei < msg.elements.length; ei++) {
-      if (validElement(msg.elements[ei])) clean.push(msg.elements[ei]);
+    const clean = [];
+    const cleanImages = [];
+    const imgBy = Object.create(null);
+    if (Array.isArray(msg.images)) {
+      for (let ii = 0; ii < msg.images.length; ii++) {
+        const im = msg.images[ii];
+        if (im && typeof im.id === 'string' && im.id.length <= 40 && typeof im.src === 'string' && im.src.length <= 2500000) {
+          cleanImages.push({ id: im.id, src: im.src });
+          imgBy[im.id] = im.src;
+        }
+      }
+    }
+    for (let ei = 0; ei < msg.elements.length; ei++) {
+      const e = msg.elements[ei];
+      if (!validElement(e)) continue;
+      if (e.type === 'image') {
+        let imgId = e.imageId;
+        let src = e.src || imgBy[imgId];
+        if (!imgId) imgId = e.id;
+        if (!src) continue; // 无图片数据的图片元素无效
+        if (!imgBy[imgId]) {
+          cleanImages.push({ id: imgId, src });
+          imgBy[imgId] = src;
+        }
+        const el2 = Object.assign({}, e);
+        el2.imageId = imgId;
+        delete el2.src;
+        clean.push(el2);
+      } else {
+        clean.push(e);
+      }
     }
     room.elements = clean;
-    room.undo.length = 0;
-    room.redo.length = 0;
+    room.images = cleanImages;
+    room.history = [];
+    room.historyIndex = -1;
     room.lastModified = now();
     broadcastState(room);
     return;
@@ -366,7 +511,7 @@ function handleMessage(room, client, msg) {
 
   if (msg.type === 'undo' || msg.type === 'redo') {
     if (client.readonly) return;
-    applyUndoRedo(room, msg.type === 'undo');
+    applyUndoRedo(room, msg.type === 'undo', client.uid);
     return;
   }
 
@@ -377,94 +522,125 @@ function handleMessage(room, client, msg) {
   switch (msg.type) {
     case 'add':
       if (validElement(msg.element) && room.elements.length < MAX_ELEMENTS) {
+        const element = attachImage(room, msg.element);
+        if (!element) return;
         if (msg.live) {
-          // 绘制过程中的实时预览：不记录撤销历史（完成时统一 commit），访问者实时看到创建过程
-          room.elements.push(msg.element);
-          broadcast(room, { type: 'element_added', element: msg.element }, client.uid);
+          // 绘制过程中的实时预览：不记录时间线（完成时统一 commit），访问者实时看到创建过程
+          room.livePending[element.id] = true;
+          room.elements.push(element);
+          broadcast(room, { type: 'element_added', element, live: true }, client.uid);
         } else {
-          pushHistory(room);
-          room.elements.push(msg.element);
-          broadcast(room, { type: 'element_added', element: msg.element }, client.uid);
+          pushHistoryOp(room, { t: 'add', el: element, i: room.elements.length });
+          room.elements.push(element);
+          broadcast(room, { type: 'element_added', element, live: false, index: room.elements.length - 1 }, client.uid);
+          broadcastHistory(room);
         }
       }
       break;
 
     case 'update': {
-      var idx = findIndexById(room, msg.id);
+      const idx = findIndexById(room, msg.id);
       if (idx < 0) return;
-      var patch = sanitizePatch(msg.patch);
-      var keys = Object.keys(patch);
+      const patch = sanitizePatch(msg.patch);
+      const keys = Object.keys(patch);
       if (!keys.length) return;
+      const br = { type: 'element_updated', id: msg.id, patch, commit: !!msg.commit };
+      let beforeEl = null;
       if (msg.commit) {
-        if (msg.undo && typeof msg.undo === 'object' && msg.undo.id === msg.id && ELEMENT_TYPES[msg.undo.type]) {
+        if (room.livePending[msg.id]) {
+          // 绘制完成（live 创建 → 首次 commit）：时间线记录为「该元素从无到有」（add）
+          delete room.livePending[msg.id];
+          br.liveDone = true;
+        } else if (msg.undo && typeof msg.undo === 'object' && msg.undo.id === msg.id && ELEMENT_TYPES[msg.undo.type]) {
           // 拖动/变换期间已有节流更新先行改动元素，
-          // 这里用拖动起点的元素快照作为历史条目，确保撤销能回到拖动前状态
-          var snap = [];
-          for (var si = 0; si < room.elements.length; si++) {
-            if (room.elements[si].id === msg.id) snap.push(JSON.parse(JSON.stringify(msg.undo)));
-            else snap.push(room.elements[si]);
-          }
-          room.undo.push(JSON.stringify(snap));
-          if (room.undo.length > UNDO_DEPTH) room.undo.shift();
-          room.redo.length = 0;
+          // 这里用拖动起点的元素快照作为 before，确保撤销能回到拖动前状态
+          beforeEl = msg.undo;
+          br.undo = msg.undo;
         } else {
-          pushHistory(room);
+          beforeEl = JSON.parse(JSON.stringify(room.elements[idx])); // 应用 patch 前快照（供远端镜像时间线）
+          br.before = beforeEl;
         }
       }
-      for (var i = 0; i < keys.length; i++) {
-        var k = keys[i];
+      for (let i = 0; i < keys.length; i++) {
+        const k = keys[i];
         if (k === 'points') {
-          room.elements[idx].points = patch[k].map(function (p) { return [p[0], p[1]]; });
+          room.elements[idx].points = patch[k].map((p) => [p[0], p[1]]);
         } else {
           room.elements[idx][k] = patch[k];
         }
       }
-      broadcast(room, { type: 'element_updated', id: msg.id, patch: patch, commit: !!msg.commit }, client.uid);
+      if (msg.commit) {
+        const afterEl = JSON.parse(JSON.stringify(room.elements[idx]));
+        if (br.liveDone) {
+          pushHistoryOp(room, { t: 'add', el: afterEl, i: idx }); // 元素最终形态作为 add 操作
+        } else if (beforeEl) {
+          pushHistoryOp(room, { t: 'upd', id: msg.id, before: JSON.parse(JSON.stringify(beforeEl)), after: afterEl });
+        }
+        broadcastHistory(room);
+      }
+      broadcast(room, br, client.uid);
       break;
     }
 
     case 'delete': {
-      var di = findIndexById(room, msg.id);
+      const di = findIndexById(room, msg.id);
       if (di >= 0) {
-        pushHistory(room);
+        const removed = room.elements[di];
+        pushHistoryOp(room, { t: 'del', el: removed, i: di });
         room.elements.splice(di, 1);
-        broadcast(room, { type: 'element_deleted', id: msg.id }, client.uid);
+        delete room.livePending[msg.id];
+        broadcast(room, { type: 'element_deleted', id: msg.id, element: removed, index: di }, client.uid);
+        broadcastHistory(room);
       }
       break;
     }
 
     case 'clear':
       if (room.elements.length) {
-        pushHistory(room);
+        pushHistoryOp(room, { t: 'clear', els: JSON.parse(JSON.stringify(room.elements)) });
         room.elements.length = 0;
+        room.livePending = Object.create(null);
         broadcast(room, { type: 'board_cleared' }, client.uid);
+        broadcastHistory(room);
       }
       break;
 
-    case 'reorder':
-      if (reorderElement(room, msg.id, msg.action)) {
-        pushHistory(room);
-        broadcast(room, { type: 'reordered', id: msg.id, action: msg.action }, client.uid);
-      }
+    case 'reorder': {
+      const rIdx = findIndexById(room, msg.id);
+      if (rIdx < 0) break;
+      const rEl = room.elements[rIdx];
+      let rTo = rIdx;
+      if (msg.action === 'toFront') rTo = room.elements.length - 1;
+      else if (msg.action === 'toBack') rTo = 0;
+      else if (msg.action === 'forward') rTo = Math.min(room.elements.length - 1, rIdx + 1);
+      else if (msg.action === 'backward') rTo = Math.max(0, rIdx - 1);
+      else break;
+      if (rTo === rIdx) break;
+      pushHistoryOp(room, { t: 'ord', id: msg.id, from: rIdx, to: rTo });
+      room.elements.splice(rIdx, 1);
+      room.elements.splice(rTo, 0, rEl);
+      broadcast(room, { type: 'reordered', id: msg.id, action: msg.action }, client.uid);
+      broadcastHistory(room);
       break;
+    }
 
     default:
       break;
   }
 }
 
-function applyUndoRedo(room, isUndo) {
+function applyUndoRedo(room, isUndo, exceptUid) {
   if (isUndo) {
-    if (!room.undo.length) return;
-    room.redo.push(JSON.stringify(room.elements));
-    room.elements = JSON.parse(room.undo.pop());
+    if (room.historyIndex < 0) return;
+    applyHistoryOp(room, room.history[room.historyIndex], true);
+    room.historyIndex--;
   } else {
-    if (!room.redo.length) return;
-    room.undo.push(JSON.stringify(room.elements));
-    room.elements = JSON.parse(room.redo.pop());
+    if (room.historyIndex >= room.history.length - 1) return;
+    room.historyIndex++;
+    applyHistoryOp(room, room.history[room.historyIndex], false);
   }
   room.lastModified = now();
-  broadcastState(room);
+  broadcastState(room, exceptUid); // 操作人本地已执行，无需 state 校正
 }
 
 function sendRaw(client, msg) {
@@ -474,31 +650,31 @@ function sendRaw(client, msg) {
 }
 
 function deny(ws, error) {
-  try { ws.send(JSON.stringify({ type: 'join_result', ok: false, error: error })); } catch (e) {}
-  setTimeout(function () { try { ws.close(); } catch (e) {} }, 300);
+  try { ws.send(JSON.stringify({ type: 'join_result', ok: false, error })); } catch (e) {}
+  setTimeout(() => { try { ws.close(); } catch (e) {} }, 300);
 }
 
 /* ---------------- HTTP 服务 ---------------- */
 function readBody(req, cb) {
-  var chunks = [];
-  var size = 0;
-  req.on('data', function (c) {
+  const chunks = [];
+  let size = 0;
+  req.on('data', (c) => {
     size += c.length;
     if (size > MAX_BODY) { req.destroy(); return; }
     chunks.push(c);
   });
-  req.on('end', function () { cb(null, Buffer.concat(chunks).toString('utf8')); });
-  req.on('error', function (e) { cb(e); });
+  req.on('end', () => cb(null, Buffer.concat(chunks).toString('utf8')));
+  req.on('error', (e) => cb(e));
 }
 
 function serveStatic(req, res) {
-  var pathname;
+  let pathname;
   try { pathname = decodeURIComponent(url.parse(req.url).pathname); }
   catch (e) { res.writeHead(400); res.end(); return; }
   if (pathname === '/') pathname = '/index.html';
-  var fp = path.normalize(path.join(PUBLIC_DIR, pathname));
+  const fp = path.normalize(path.join(PUBLIC_DIR, pathname));
   if (fp.indexOf(PUBLIC_DIR) !== 0) { res.writeHead(403); res.end(); return; }
-  fs.readFile(fp, function (err, data) {
+  fs.readFile(fp, (err, data) => {
     if (err) {
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('404 Not Found');
@@ -512,15 +688,15 @@ function serveStatic(req, res) {
   });
 }
 
-var server = http.createServer(function (req, res) {
-  var u = url.parse(req.url, true);
+const server = http.createServer((req, res) => {
+  const u = url.parse(req.url, true);
   if (req.method === 'POST' && u.pathname === '/api/create') {
-    readBody(req, function (err, body) {
+    readBody(req, (err, body) => {
       if (err) { res.writeHead(400); res.end('{"ok":false,"error":"bad request"}'); return; }
-      var data = {};
+      let data = {};
       try { data = JSON.parse(body || '{}'); } catch (e) {}
       // 可选的自定义房间号：仅允许大写字母 + 数字，1-10 位
-      var rid = String(data.roomId || '').trim().toUpperCase();
+      const rid = String(data.roomId || '').trim().toUpperCase();
       if (rid) {
         if (!/^[A-Z0-9]{1,10}$/.test(rid)) {
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' });
@@ -533,7 +709,7 @@ var server = http.createServer(function (req, res) {
           return;
         }
       }
-      var room = createRoom(String(data.name || ''), String(data.pwd || ''), rid || null);
+      const room = createRoom(String(data.name || ''), String(data.pwd || ''), rid || null);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' });
       res.end(JSON.stringify({
         ok: true,
@@ -548,10 +724,10 @@ var server = http.createServer(function (req, res) {
 
   /* ---------------- 房间存在性 / 密码校验（首页加入前预检） ---------------- */
   if (u.pathname === '/api/room' && req.method === 'GET') {
-    var rid2 = String(u.query.id || '').trim().toUpperCase();
-    var room2 = rooms[rid2];
+    const rid2 = String(u.query.id || '').trim().toUpperCase();
+    const room2 = rooms[rid2];
     // 密码校验规则与 tryJoin 一致：无密码则通过；有密码则需匹配（创建者凭 key 不受限）
-    var pwdOk2 = !room2 || !room2.pwd || (String(u.query.pwd || '') === room2.pwd);
+    const pwdOk2 = !room2 || !room2.pwd || (String(u.query.pwd || '') === room2.pwd);
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' });
     res.end(JSON.stringify({ ok: true, exists: !!room2, pwdOk: pwdOk2 }));
     return;
@@ -560,7 +736,7 @@ var server = http.createServer(function (req, res) {
   /* ---------------- 管理员（HTTP 基本认证；账号由启动参数配置） ---------------- */
   if (u.pathname === '/admin' || u.pathname === '/admin.html') {
     if (ADMIN_ENABLED && !basicAuthOk(req)) { needAuth(res); return; }
-    fs.readFile(path.join(PUBLIC_DIR, 'admin.html'), function (err, data) {
+    fs.readFile(path.join(PUBLIC_DIR, 'admin.html'), (err, data) => {
       if (err) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('404 Not Found'); return; }
       res.writeHead(200, { 'Content-Type': MIME['.html'] || 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
       res.end(data);
@@ -577,11 +753,11 @@ var server = http.createServer(function (req, res) {
   if (u.pathname === '/api/admin/delete_room' && req.method === 'POST') {
     if (!ADMIN_ENABLED) { adminDisabled(res); return; }
     if (!basicAuthOk(req)) { needAuth(res); return; }
-    readBody(req, function (err, body) {
+    readBody(req, (err, body) => {
       if (err) { res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' }); res.end('{"ok":false,"error":"bad request"}'); return; }
-      var data = {};
+      let data = {};
       try { data = JSON.parse(body || '{}'); } catch (e) {}
-      var r = rooms[data.id];
+      const r = rooms[data.id];
       if (!r) {
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' });
         res.end(JSON.stringify({ ok: false, error: '房间不存在' }));
@@ -596,8 +772,8 @@ var server = http.createServer(function (req, res) {
   if (u.pathname === '/api/admin/delete_all' && req.method === 'POST') {
     if (!ADMIN_ENABLED) { adminDisabled(res); return; }
     if (!basicAuthOk(req)) { needAuth(res); return; }
-    var ids = Object.keys(rooms);
-    for (var ai = 0; ai < ids.length; ai++) deleteRoom(rooms[ids[ai]]);
+    const ids = Object.keys(rooms);
+    for (let ai = 0; ai < ids.length; ai++) deleteRoom(rooms[ids[ai]]);
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' });
     res.end(JSON.stringify({ ok: true, deleted: ids.length }));
     return;
@@ -610,27 +786,33 @@ var server = http.createServer(function (req, res) {
  * 开启会导致连接一直停留在 connecting 状态。
  * 连接方式与 iOS9 正常示例一致：连 /ws（不带任何查询参数），
  * 打开后在首条消息里发送 hello {room,pwd,key,ro,name} 完成加入。 */
-var wss = new WebSocketServer({ server: server, path: '/ws', maxPayload: MAX_MSG, perMessageDeflate: false });
+const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_MSG, perMessageDeflate: false });
 
 function tryJoin(ws, msg, req) {
-  var room = rooms[msg.room];
+  const room = rooms[msg.room];
   if (!room || room.deleted) { deny(ws, '房间不存在，请检查房间号'); return null; }
 
-  var isOwner = msg.key && msg.key === room.ownerKey;
-  var pwdOk = !room.pwd || (msg.pwd || '') === room.pwd;
+  const isOwner = msg.key && msg.key === room.ownerKey;
+  const pwdOk = !room.pwd || (msg.pwd || '') === room.pwd;
   if (!isOwner && !pwdOk) { deny(ws, '房间密码错误'); return null; }
 
-  // 只读权限由分享链接中的 ro=1 决定（创建者始终可编辑）
-  var readonly = isOwner ? false : (msg.ro === '1');
-  var client = {
+  // 基础权限由分享链接 ro=1 决定（创建者始终可编辑）；
+  // 房间设置「可编辑用户禁止编辑」forceRO 开启时，可编辑访客降级为只读；
+  // noLaser 由房间设置「只读用户禁用激光笔」决定（对只读成员即时生效）
+  const baseReadonly = isOwner ? false : (msg.ro === '1');
+  const readonly = isOwner ? false : (baseReadonly || room.forceRO);
+  const noLaser = !isOwner && readonly && !!room.noLaserRO;
+  const client = {
     uid: randId(10, 'abcdefghijklmnopqrstuvwxyz0123456789'),
     // 创建者的名字始终显示为“房主”
     name: isOwner ? '房主' : (String(msg.name || '').slice(0, 20) || ('访客' + Math.floor(Math.random() * 900 + 100))),
     // 房主标记颜色始终为红色；访客从非红色色板中随机分配
     color: isOwner ? '#E53935' : USER_COLORS[1 + Math.floor(Math.random() * (USER_COLORS.length - 1))],
-    readonly: readonly,
+    readonly,
+    baseReadonly, // 基础权限（不含 forceRO 动态降级），供房间设置切换时恢复/降级
+    noLaser,
     owner: isOwner,
-    ws: ws
+    ws
   };
   room.clients[client.uid] = client;
   room.lastActive = now();
@@ -638,27 +820,30 @@ function tryJoin(ws, msg, req) {
 
   sendRaw(client, {
     type: 'welcome',
-    self: { uid: client.uid, name: client.name, color: client.color, readonly: client.readonly, owner: client.owner },
-    room: { id: room.id, name: room.name, pwd: room.pwd, shareUrl: shareUrl(req, room) },
+    self: { uid: client.uid, name: client.name, color: client.color, readonly: client.readonly, baseReadonly: client.baseReadonly, noLaser: client.noLaser, owner: client.owner },
+    room: { id: room.id, name: room.name, pwd: room.pwd, noLaserRO: room.noLaserRO, forceRO: room.forceRO, shareUrl: shareUrl(req, room) },
     elements: room.elements,
+    images: room.images,
     users: listUsers(room),
-    undoable: room.undo.length > 0,
-    redoable: room.redo.length > 0
+    history: room.history,          // 操作时间线（PS 式：操作记录数组，非全量快照）
+    historyIndex: room.historyIndex,
+    undoable: room.historyIndex >= 0,
+    redoable: room.historyIndex < room.history.length - 1
   });
   broadcast(room, { type: 'user_joined', user: { uid: client.uid, name: client.name, color: client.color, readonly: client.readonly } }, client.uid);
   return client;
 }
 
-wss.on('connection', function (ws, req) {
-  var client = null;
-  var joined = false;
+wss.on('connection', (ws, req) => {
+  let client = null;
+  let joined = false;
   // 若 8 秒内未发送 hello，关闭连接（保护资源）
-  var helloTimer = setTimeout(function () {
+  const helloTimer = setTimeout(() => {
     if (!joined) { try { ws.close(); } catch (e) {} }
   }, 8000);
 
-  ws.on('message', function (data) {
-    var msg;
+  ws.on('message', (data) => {
+    let msg;
     try { msg = JSON.parse(String(data)); } catch (e) { return; }
     if (!msg || typeof msg.type !== 'string') return;
 
@@ -672,14 +857,14 @@ wss.on('connection', function (ws, req) {
     }
     handleMessage(roomOf(client), client, msg);
   });
-  ws.on('close', function () {
+  ws.on('close', () => {
     if (joined && client && roomOf(client).clients[client.uid]) {
-      var r = roomOf(client);
+      const r = roomOf(client);
       delete r.clients[client.uid];
       broadcast(r, { type: 'user_left', uid: client.uid });
     }
   });
-  ws.on('error', function () {});
+  ws.on('error', () => {});
 });
 
 function roomOf(client) {
@@ -687,18 +872,18 @@ function roomOf(client) {
 }
 
 /* 空闲房间自动回收：空白板无访问 1 小时删除；有内容白板无访问或修改 7 天删除（不阻塞进程退出） */
-setInterval(function () {
-  var t = now();
-  Object.keys(rooms).forEach(function (id) {
-    var r = rooms[id];
+setInterval(() => {
+  const t = now();
+  Object.keys(rooms).forEach((id) => {
+    const r = rooms[id];
     if (!r) return;
-    var lastMod = r.lastModified || r.lastActive;
-    var idle = t - Math.max(r.lastActive, lastMod);
-    var ttl = r.elements.length ? ROOM_TTL_CONTENT_MS : ROOM_TTL_EMPTY_MS;
+    const lastMod = r.lastModified || r.lastActive;
+    const idle = t - Math.max(r.lastActive, lastMod);
+    const ttl = r.elements.length ? ROOM_TTL_CONTENT_MS : ROOM_TTL_EMPTY_MS;
     if (idle > ttl) delete rooms[id];
   });
 }, 10 * 60 * 1000).unref();
 
-server.listen(PORT, '0.0.0.0', function () {
-  console.log('共享白板服务已启动: http://localhost:' + PORT);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`共享白板服务已启动: http://localhost:${PORT}`);
 });

@@ -132,6 +132,10 @@ button.disabled, button[disabled] { opacity: 0.45; pointer-events: none; }
   color: #fff;
   font-weight: 600;
 }
+/* 橡皮擦模式：隐藏系统光标，由画布绘制半透明方块代替 */
+#board.eraser-active { cursor: none; }
+/* 撤销/重做等待服务端返回时的加载态 */
+button.loading { opacity: 0.6; pointer-events: none; }
 
 /* ===== 右侧属性面板（可折叠） ===== */
 #panel {

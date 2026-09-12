@@ -19,18 +19,14 @@
         id="userCount">连接中…</span></div>
     <div id="roBadge" class="ro-badge hidden">只读</div>
     <div class="top-actions">
-      <button id="btnUndo" title="撤销 (Ctrl+Z)">撤销</button>
-      <button id="btnRedo" title="重做 (Ctrl+Y)">重做</button>
+      <button id="btnUndo" class="disabled" title="撤销 (Ctrl+Z)">撤销</button>
+      <button id="btnRedo" class="disabled" title="重做 (Ctrl+Y)">重做</button>
+      <button id="btnClearTop" class="danger" title="清空画布">清空</button>
       <span class="sep" data-edit="1"></span>
       <button id="btnZoomOut" title="缩小">−</button>
       <button id="btnZoomLabel" title="缩放比例">100%</button>
       <button id="btnZoomIn" title="放大">＋</button>
       <button id="btnZoomFit" title="适应画布">适应</button>
-      <span class="sep" data-edit="1"></span>
-      <button id="btnCopy" data-edit="1" title="复制选中的图案 (Ctrl+C)">复制</button>
-      <button id="btnDelete" class="warning" data-edit="1" title="删除选中的图案 (Delete)">删除</button>
-      <button id="btnClearTop" class="danger" title="清空画布">清空</button>
-      <button id="btnExportImg" title="导出当前白板为图片">导出</button>
       <span class="sep" data-edit="1"></span>
       <button id="btnPanelTop" class="active" title="展开 / 收起属性面板">属性</button>
       <button id="btnFullscreen" title="隐藏工具栏">隐藏工具栏</button>
@@ -52,6 +48,8 @@
     <button data-tool="circle" data-edit="1" title="圆形">圆形</button>
     <button data-tool="text" data-edit="1" title="文本">文本</button>
     <button data-tool="image" data-edit="1" title="插入图片">图片</button>
+    <button id="btnCopyTool" data-action="copy" class="tool-action disabled" data-edit="1" title="复制选中的图案 (Ctrl+C)">复制</button>
+    <button data-tool="eraser" data-edit="1" title="橡皮：选中图案时删除，未选中时点击擦除">橡皮</button>
     <button data-tool="bucket" data-edit="1" title="油漆桶：填充颜色">油漆桶</button>
     <button data-tool="laser" title="激光笔：指点位置">激光笔</button>
   </div>
@@ -158,18 +156,8 @@
 
   <!-- ===== 内联文本输入（文本工具点击画布后直接输入，不弹窗） ===== -->
   <textarea id="inlineText" class="hidden" placeholder="输入文字，点击其它位置或按 Esc 完成"></textarea>
-
-  <!-- ===== 图片插入弹窗 ===== -->
-  <div id="imgModal" class="modal hidden">
-    <div class="modal-box">
-      <h3>插入图片</h3>
-      <p>从相册选择一张图片，将自动压缩后插入画布中央。</p>
-      <input type="file" id="imgFile" accept="image/*">
-      <div class="modal-actions">
-        <button id="btnCloseImg">取消</button>
-      </div>
-    </div>
-  </div>
+  <!-- 图片文件选择（隐藏 input，点图片工具直接触发） -->
+  <input type="file" id="imgFile" accept="image/*" class="hidden">
 
   <!-- ===== 分享弹窗（分享时选择只读；导出/导入配置） ===== -->
   <div id="shareModal" class="modal hidden">
@@ -188,6 +176,7 @@
       <div class="config-actions">
         <button id="btnExportCfg" title="导出当前白板的配置（JSON 文件）">导出配置</button>
         <button id="btnImportCfg" class="hidden" title="导入配置将覆盖当前白板全部内容（仅房主）">导入配置</button>
+        <button id="btnShareExportImg" title="导出当前白板为图片">导出图片</button>
         <input type="file" id="importFile" accept=".json,application/json" class="hidden">
       </div>
       <div class="modal-actions">
@@ -206,6 +195,14 @@
       </label>
       <label class="field">访问密码（留空表示无需密码）
         <input id="roomPwdInput" type="text" maxlength="40" placeholder="修改后，新加入者需使用新密码">
+      </label>
+      <label class="check" id="roomForceRORow">
+        <input type="checkbox" id="roomForceRO">
+        <span>可编辑用户禁止编辑（降级为只读）</span>
+      </label>
+      <label class="check" id="roomNoLaserRow">
+        <input type="checkbox" id="roomNoLaserRO">
+        <span>只读用户禁用激光笔</span>
       </label>
       <div class="modal-actions">
         <button id="btnRoomOk" class="primary">确定</button>

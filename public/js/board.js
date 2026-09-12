@@ -9,11 +9,12 @@
  *    矩形 / 圆形 / 文本 / 图片 / 油漆桶 / 激光笔
  *  - 图案编辑：拖动移动、锚点式缩放、旋转，单击旋转圈复位到初始几何
  *  - 多选组整体移动 / 缩放 / 旋转 / 复位 / 复制 / 删除
- *  - 撤销 / 重做、清空画布、复制 / 删除选中图案
+ *  - 撤销 / 重做（本地时间线立即执行）、清空画布、复制 / 橡皮删除选中图案
  *  - 自定义颜色（RGB 滑块）、透明度、线宽、字号、层次（置顶/上移/置底/下移）
- *  - 只读模式（ro=1）：只读用户仅查看 / 缩放 / 激光笔 / 分享只读链接 / 退出
+ *  - 只读模式（ro=1）：只读用户仅查看 / 缩放 / 激光笔 / 分享只读链接 / 退出；
+ *    房间设置可「只读禁用激光笔」「可编辑用户禁止编辑（降级为只读）」
  *  - 隐藏工具栏演示模式 + 浏览器全屏（F11）
- *  - 房主专属：重命名白板、退出（保留白板）、删除白板
+ *  - 房主专属：房间设置（改名 / 改密码 / 房间策略）、退出（保留白板）、删除白板
  * ============================================================ */
 (function () {
   'use strict';
@@ -23,6 +24,8 @@
   function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
   function dist(x1, y1, x2, y2) { var dx = x2 - x1, dy = y2 - y1; return Math.sqrt(dx * dx + dy * dy); }
   function dist2(x1, y1, x2, y2) { var dx = x2 - x1, dy = y2 - y1; return dx * dx + dy * dy; }
+  /* 几何坐标只保留 2 位小数（缩放/移动/旋转/复位后避免浮点尾数累积成超长小数） */
+  function round2(v) { return Math.round(v * 100) / 100; }
   function uid() {
     return 'e' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
   }
@@ -39,6 +42,73 @@
     return i >= 0 ? elements[i] : null;
   }
   function deepCopy(o) { return JSON.parse(JSON.stringify(o)); }
+
+  /* 图片数据池查询：按 imageId 取 src（渲染用） */
+  function imageSrcById(imgId) {
+    for (var i = 0; i < images.length; i++) {
+      if (images[i].id === imgId) return images[i].src;
+    }
+    return null;
+  }
+
+  /* ================= 操作时间线（PS 式单条时间线：与服务器同一模型，撤销/重做本地立即执行） =================
+   * 每条记录是一个操作：{t:'add',el,i} / {t:'upd',id,before,after} / {t:'del',el,i} / {t:'clear',els} / {t:'ord',id,from,to}
+   * historyIndex 指向最后一条已应用操作；撤销 = 逆应用指针处操作并回退；重做 = 前进并正应用；新操作截断未来。 */
+  function localPush(op) {
+    if (localHistoryIndex < localHistory.length - 1) localHistory.length = localHistoryIndex + 1; // 新操作截断未来
+    localHistory.push(op);
+    if (localHistory.length > 100) {
+      localHistory.shift();
+      localHistoryIndex--;
+    }
+    localHistoryIndex++;
+    updateUndoRedoBtns();
+  }
+  function applyHistoryOp(op, inverse) {
+    if (op.t === 'add') {
+      if (inverse) {
+        var ai = indexOfId(elements, op.el.id);
+        if (ai >= 0) elements.splice(ai, 1);
+      } else if (indexOfId(elements, op.el.id) < 0) {
+        var at = Math.max(0, Math.min(op.i, elements.length));
+        elements.splice(at, 0, op.el);
+      }
+    } else if (op.t === 'del') {
+      if (inverse) {
+        if (indexOfId(elements, op.el.id) < 0) {
+          var di = Math.max(0, Math.min(op.i, elements.length));
+          elements.splice(di, 0, op.el);
+        }
+      } else {
+        var ddx = indexOfId(elements, op.el.id);
+        if (ddx >= 0) elements.splice(ddx, 1);
+      }
+    } else if (op.t === 'upd') {
+      var ui = indexOfId(elements, op.id);
+      if (ui >= 0) {
+        var snap = inverse ? op.before : op.after;
+        var k;
+        for (k in snap) {
+          if (snap.hasOwnProperty(k)) elements[ui][k] = snap[k];
+        }
+      }
+    } else if (op.t === 'clear') {
+      if (inverse) elements = deepCopy(op.els);
+      else elements = [];
+    } else if (op.t === 'ord') {
+      var oi = indexOfId(elements, op.id);
+      if (oi < 0) return;
+      var oEl = elements.splice(oi, 1)[0];
+      var oTo = inverse ? op.from : op.to;
+      oTo = Math.max(0, Math.min(oTo, elements.length));
+      elements.splice(oTo, 0, oEl);
+    }
+    // 撤销/重做后清理选中与几何缓存，保证渲染与后续拖动基于最新状态
+    selectedId = null;
+    selectedIds = [];
+    pruneSelection();
+    captureOrigins();
+  }
   function segPointDist(px, py, ax, ay, bx, by) {
     var dx = bx - ax, dy = by - ay;
     var len2 = dx * dx + dy * dy;
@@ -73,10 +143,15 @@
   var joinFailed = false;    // 加入被拒绝（房间不存在/密码错误），停止重连
   var myUid = null, myName = '访客', myColor = '#E53935';
   var readonly = false;
+  var myBaseRO = false;        // 基础权限（URL ro=1 决定，不含房间 forceRO 动态降级）
+  var noLaser = false;         // 房间设置「只读用户禁用激光笔」：只读成员不可用激光笔（防御）
   var isOwner = false;
   var roomInfo = null;
   var users = [];            // [{uid,name,color,readonly,owner}]
   var elements = [];         // 本地元素镜像（数组顺序即层次，越靠后越在上层）
+  var images = [];           // 图片数据池 [{id, src}]：元素只存 imageId 引用，复制不重复存储
+  var localHistory = [], localHistoryIndex = -1; // 操作时间线（与服务器同一模型）
+  var localLive = {};        // id -> true：本地 live 创建尚未 commit 的元素（时间线 add 语义区分）
   var selectedId = null;     // 主选中元素 id（单选时唯一；多选时取 selectedIds 最后一位）
   var selectedIds = [];      // 多选：选中元素 id 的有序数组（框选产生），最后一位为主选中
   var copyBuffer = null;     // 复制剪贴板：元素数组（Ctrl+C 存入，Ctrl+V 粘贴）
@@ -98,6 +173,7 @@
   var view = { zoom: 1, panX: 0, panY: 0 };
   var drag = null;           // 当前手势状态
   var lastPointer = { x: 0, y: 0 };
+  var eraserCursor = { x: -1, y: -1 }; // 橡皮模式光标位置（屏幕坐标，用于绘制半透明橡皮方块）
   var lastUpdateSend = 0;
   var lastLaserSend = 0;
 
@@ -198,6 +274,14 @@
     }
 
     drawLasers();
+    // 橡皮光标：半透明正方形（屏幕固定大小），未选中擦除模式下显示
+    if (tool === 'eraser' && !readonly && eraserCursor.x >= 0) {
+      var es = 22;
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = '#1E88E5';
+      ctx.fillRect(eraserCursor.x - es / 2, eraserCursor.y - es / 2, es, es);
+      ctx.globalAlpha = 1;
+    }
   }
 
   /* ================= 元素几何：各类图案的包围盒（含 pen 点集） ================= */
@@ -398,8 +482,9 @@
         }
 
       } else if (t === 'image') {
-        var im = imageCache[el.id] || (imageCache[el.id] = loadImage(el.src));
-        if (im.loaded) {
+        var imgSrc = imageSrcById(el.imageId);
+        var im = imgSrc ? (imageCache[el.imageId] || (imageCache[el.imageId] = loadImage(imgSrc))) : null;
+        if (im && im.loaded) {
           ctx.drawImage(im.img, -el.w / 2, -el.h / 2, el.w, el.h);
         } else {
           ctx.strokeStyle = '#bbb';
@@ -527,6 +612,7 @@
         }
       }
       if (live) { requestRender(); scheduleLaserFade(); }
+      else { requestRender(); } // 轨迹全部过期：停止前再渲染一帧，清掉最后残留段
     }, 50);
   }
   function drawLasers() {
@@ -536,22 +622,25 @@
       var uidKey = keys[i];
       var lu = laserUsers[uidKey];
       if (!lu) continue;
-      // 按时间过滤出存活轨迹点
+      // 按时间过滤出存活轨迹点；过期点物理移除，避免残留数据导致画面无法彻底清空
       var pts = [];
-      for (var k = 0; k < lu.trail.length; k++) {
+      for (var k = lu.trail.length - 1; k >= 0; k--) {
         if (nowT - lu.trail[k].t <= LASER_TRAIL_MS) pts.push(lu.trail[k]);
+        else lu.trail.splice(k, 1);
       }
+      pts.reverse();
       // 松开后（active=false）不立即清空：残留轨迹继续渐隐；无残留点则跳过
       if (!lu.active && pts.length < 2) continue;
       var rgb = hexToRgb(laserColorOf(uidKey));
-      // 逐渐消失的线：从旧到新逐段绘制，越旧越透明
+      // 逐渐消失的线：从旧到新逐段绘制，越旧越透明（最旧点完全透明）
       if (pts.length >= 2) {
         for (var j = 1; j < pts.length; j++) {
           var p0 = worldToScreen(pts[j - 1].x, pts[j - 1].y);
           var p1 = worldToScreen(pts[j].x, pts[j].y);
           var age0 = clamp(1 - (nowT - pts[j - 1].t) / LASER_TRAIL_MS, 0, 1);
           var age1 = clamp(1 - (nowT - pts[j].t) / LASER_TRAIL_MS, 0, 1);
-          var a = 0.12 + 0.75 * (age0 + age1) / 2;
+          var a = 0.75 * (age0 + age1) / 2;
+          if (a <= 0.01) continue;
           ctx.strokeStyle = 'rgba(' + rgb.r + ',' + rgb.g + ',' + rgb.b + ',' + a.toFixed(3) + ')';
           ctx.lineWidth = 3;
           ctx.lineCap = 'round';
@@ -686,31 +775,53 @@
       case 'welcome':
         myUid = msg.self.uid; myName = msg.self.name; myColor = msg.self.color;
         readonly = !!msg.self.readonly;
+        myBaseRO = !!msg.self.baseReadonly; // 基础权限（不含房间 forceRO 动态降级）
+        noLaser = !!msg.self.noLaser; // 服务端权威（防 URL 篡改）
         isOwner = !!msg.self.owner;
         roomInfo = msg.room;
         elements = msg.elements;
+        images = msg.images || [];
         users = msg.users;
-        undoable = msg.undoable; redoable = msg.redoable;
+        localHistory = msg.history || [];        // 操作时间线（PS 式单条时间线）
+        localHistoryIndex = typeof msg.historyIndex === 'number' ? msg.historyIndex : (localHistory.length - 1);
+        localLive = {};
+        undoable = !!msg.undoable; redoable = !!msg.redoable;
         selectedId = null;
         selectedIds = [];
         captureOrigins();
         applyRoomUI();
+        updateUndoRedoBtns();
         render();
         break;
 
       case 'state':
         elements = msg.elements;
-        undoable = msg.undoable; redoable = msg.redoable;
+        images = msg.images || [];
+        localHistory = msg.history || [];
+        localHistoryIndex = typeof msg.historyIndex === 'number' ? msg.historyIndex : (localHistory.length - 1);
+        localLive = {};
+        undoable = !!msg.undoable; redoable = !!msg.redoable;
+        updateUndoRedoBtns();
         pruneSelection();
         captureOrigins();
         cleanupRemoteSelections();
         render();
         break;
 
+      case 'history':
+        // 撤销/重做已改为本地时间线执行：服务器仅广播可用状态，本地时间线镜像所有操作后与其一致
+        break;
+
+      case 'image_added':
+        if (msg.image && msg.image.id && !imageSrcById(msg.image.id)) images.push(msg.image);
+        break;
+
       case 'element_added':
         if (indexOfId(elements, msg.element.id) < 0) {
           elements.push(msg.element);
           if (!origShapes[msg.element.id]) origShapes[msg.element.id] = deepCopy(msg.element);
+          // 镜像时间线：非 live 创建 → 记录「添加该元素」
+          if (!msg.live) localPush({ t: 'add', el: msg.element, i: typeof msg.index === 'number' ? msg.index : elements.length - 1 });
         }
         render();
         break;
@@ -720,6 +831,10 @@
         if (el) {
           var p = msg.patch, k;
           for (k in p) { if (p.hasOwnProperty(k)) el[k] = p[k]; }
+          // 镜像时间线（与服务器提交语义一致）：live 完成 → add；带 undo/before → upd
+          if (msg.commit && msg.liveDone) localPush({ t: 'add', el: deepCopy(el), i: indexOfId(elements, msg.id) });
+          else if (msg.commit && msg.undo && msg.undo.id === msg.id) localPush({ t: 'upd', id: msg.id, before: msg.undo, after: deepCopy(el) });
+          else if (msg.commit && msg.before && msg.before.id === msg.id) localPush({ t: 'upd', id: msg.id, before: msg.before, after: deepCopy(el) });
           render();
         }
         break;
@@ -728,12 +843,15 @@
       case 'element_deleted': {
         var di = indexOfId(elements, msg.id);
         if (di >= 0) {
+          // 镜像时间线：记录「删除该元素」（含原位置，供撤销恢复）
+          if (msg.element) localPush({ t: 'del', el: msg.element, i: typeof msg.index === 'number' ? msg.index : di });
           elements.splice(di, 1);
           delete origShapes[msg.id];
           var si = selectedIds.indexOf(msg.id);
           if (si >= 0) selectedIds.splice(si, 1);
           if (selectedId === msg.id) selectedId = selectedIds.length ? selectedIds[selectedIds.length - 1] : null;
           updateSelInfo();
+          updateCopyBtn();
           cleanupRemoteSelections();
           render();
         }
@@ -741,11 +859,13 @@
       }
 
       case 'board_cleared':
+        if (elements.length) localPush({ t: 'clear', els: deepCopy(elements) }); // 清空前全量（仅此一次，恢复用）
         elements = [];
         origShapes = {};
         selectedId = null;
         selectedIds = [];
         updateSelInfo();
+        updateCopyBtn();
         cleanupRemoteSelections();
         render();
         break;
@@ -803,6 +923,44 @@
         if (isOwner) setStatus('访问密码已更新');
         break;
 
+      case 'room_laser_policy':
+        // 房间设置「只读用户禁用激光笔」变更：更新房间信息并即时生效于在线只读成员
+        if (roomInfo) roomInfo.noLaserRO = !!msg.noLaserRO;
+        if (readonly) {
+          var wasNoLaser = noLaser;
+          noLaser = !!msg.noLaserRO;
+          if (noLaser !== wasNoLaser) {
+            if (noLaser && tool === 'laser') setTool('hand'); // 禁用时切走激光笔
+            applyReadonlyUI();
+          }
+        }
+        break;
+
+      case 'room_edit_policy':
+        // 房间设置「可编辑用户禁止编辑」变更：可编辑访客被降级为只读 / 恢复编辑
+        if (roomInfo) roomInfo.forceRO = !!msg.forceRO;
+        if (!isOwner) {
+          var wantRO = myBaseRO || !!msg.forceRO;
+          if (wantRO !== readonly) {
+            readonly = wantRO;
+            noLaser = readonly && !!roomInfo.noLaserRO;
+            if (readonly) {
+              // 降级：提交未完成的文本编辑、清理选中、切到抓手、应用只读界面
+              if (inlineActive) commitInlineText();
+              setSelection(null, true);
+              applyReadonlyUI();
+              if (tool !== 'hand') setTool('hand');
+              setStatus('你已被降级为只读用户');
+            } else {
+              // 恢复编辑权限：恢复编辑界面与默认画笔工具
+              applyRoomUI();
+              setTool('pen');
+              setStatus('你已恢复编辑权限');
+            }
+          }
+        }
+        break;
+
       case 'room_deleted':
         roomGone = true;
         try { localStorage.removeItem('wb_recent_colors'); } catch (e) {}
@@ -847,10 +1005,16 @@
   }
 
   /* 只读模式：直接显示只读应有的功能（隐藏一切编辑能力），
-   * 进入页面时若 URL 带 ro=1 立即应用，避免先加载全部功能再隐藏 */
+   * 进入页面时若 URL 带 ro=1 立即应用，避免先加载全部功能再隐藏；
+   * noLaser（房间设置「只读用户禁用激光笔」）：额外隐藏激光笔按钮（工具栏保留抓手） */
   function applyReadonlyUI() {
     $('roBadge').classList.remove('hidden');
-    setStatus('只读模式：只能查看、缩放、激光指点');
+    var laserBtn = document.querySelector('[data-tool="laser"]');
+    if (noLaser) {
+      if (laserBtn) laserBtn.classList.add('hidden');
+    } else {
+      if (laserBtn) laserBtn.classList.remove('hidden');
+    }
     var btns = $('toolbar').children;
     for (var i = 0; i < btns.length; i++) {
       if (btns[i].getAttribute('data-edit')) btns[i].classList.add('hidden');
@@ -861,8 +1025,7 @@
     $('btnUndo').classList.add('hidden');
     $('btnRedo').classList.add('hidden');
     $('btnClearTop').classList.add('hidden');
-    $('btnCopy').classList.add('hidden');
-    $('btnDelete').classList.add('hidden');
+    $('btnCopyTool').classList.add('hidden');
     $('btnPanelTop').classList.add('hidden');
     $('panel').classList.add('hidden');
     // 只读用户也有「退出」按钮（退出不影响白板内容）
@@ -870,6 +1033,8 @@
     // 只读用户只能分享只读链接：隐藏「可编辑」选项
     $('shareModeEditRow').classList.add('hidden');
     setTool('hand');
+    // 状态提示在 setTool 之后设置（setTool 会写入工具提示，避免被覆盖）
+    setStatus(noLaser ? '只读模式：只能查看、缩放' : '只读模式：只能查看、缩放、激光指点');
   }
 
   function applyRoomUI() {
@@ -887,7 +1052,10 @@
       applyReadonlyUI();
     } else {
       $('roBadge').classList.add('hidden');
-      // 可编辑用户：编辑功能与「属性」按钮直接显示（防御性恢复，避免任何时序下被隐藏）
+      // 可编辑用户：编辑功能与「属性」按钮直接显示（防御性恢复，避免任何时序下被隐藏）；
+      // 激光笔按钮也一并恢复（降级时可能被 applyReadonlyUI 隐藏；可编辑用户始终可用激光笔）
+      var laserBtn2 = document.querySelector('[data-tool="laser"]');
+      if (laserBtn2) laserBtn2.classList.remove('hidden');
       var btns2 = $('toolbar').children;
       for (var j = 0; j < btns2.length; j++) {
         if (btns2[j].getAttribute('data-edit')) btns2[j].classList.remove('hidden');
@@ -897,14 +1065,15 @@
       $('btnUndo').classList.remove('hidden');
       $('btnRedo').classList.remove('hidden');
       $('btnClearTop').classList.remove('hidden');
-      $('btnCopy').classList.remove('hidden');
-      $('btnDelete').classList.remove('hidden');
+      $('btnCopyTool').classList.remove('hidden');
       $('btnPanelTop').classList.remove('hidden');
       $('panel').classList.remove('hidden');
       $('shareModeEditRow').classList.remove('hidden');
       // 访问者 / 房主都有「退出」按钮
       $('btnExit').classList.remove('hidden');
     }
+    updateUndoRedoBtns();
+    updateCopyBtn();
   }
 
   function renderUsers() {
@@ -948,7 +1117,12 @@
   };
   function setTool(t) {
     if (inlineActive) commitInlineText(); // 切换工具前先提交未完成的内联文本
+    // 橡皮：已有选中时直接删除选中（工具保持不变）；未选中才进入橡皮擦模式
+    if (t === 'eraser') {
+      if (selectedIds.length) { deleteSelected(); return; }
+    }
     tool = t;
+    eraserCursor = { x: -1, y: -1 };
     var btns = $('toolbar').children;
     for (var i = 0; i < btns.length; i++) {
       var b = btns[i];
@@ -956,29 +1130,74 @@
         (b.className.indexOf('hidden') >= 0 ? ' hidden' : '') +
         (b.className.indexOf('disabled') >= 0 ? ' disabled' : '');
     }
-    if (t !== 'select') setSelection(null);
+    if (t !== 'select') {
+      // 切换工具：有选中时广播清除（远端同步取消选择框）；无选中时静默，避免传输空 sel
+      if (selectedIds.length) setSelection(null);
+      else setSelection(null, true);
+    }
+    canvas.className = (tool === 'eraser' && !readonly) ? 'eraser-active' : '';
     setStatus(TOOL_HINTS[t] || '');
     render();
   }
   $('toolbar').addEventListener('click', function (e) {
     if (inlineActive) commitInlineText();
     var b = e.target;
-    while (b && b !== this && !b.getAttribute('data-tool')) b = b.parentNode;
-    if (!b || !b.getAttribute('data-tool')) return;
+    while (b && b !== this && !b.getAttribute('data-tool') && !b.getAttribute('data-action')) b = b.parentNode;
+    if (!b || b === this) return;
+    // 工具栏内的动作按钮（复制）：仅选中图案时可点击
+    if (b.getAttribute('data-action') === 'copy') {
+      if (readonly) return;
+      if (selectedIds.length) copySelected();
+      else setStatus('先选择要复制的图案');
+      return;
+    }
     var t = b.getAttribute('data-tool');
+    if (!t) return;
     if (readonly && b.getAttribute('data-edit')) return;
-    if (t === 'image') { showImgModal(); return; }
+    if (t === 'image') { openImgPicker(); return; }
     setTool(t);
   });
   /* 顶部栏「清空」按钮（二次确认） */
   $('btnClearTop').addEventListener('click', confirmClear);
-  /* 顶部「删除」：选中图案后点击才删除；「复制」：复制一份选中图案 */
-  $('btnCopy').addEventListener('click', copySelected);
-  $('btnDelete').addEventListener('click', deleteSelected);
+  /* 工具栏「复制」按钮：选中图案时才可点击（disabled 状态随选择变化） */
+  function updateCopyBtn() {
+    var b = $('btnCopyTool');
+    if (!b) return;
+    var c = 'tool-action' + (readonly || !selectedIds.length ? ' disabled' : '');
+    if (b.className.indexOf('hidden') >= 0) c += ' hidden';
+    b.className = c;
+  }
 
   /* ================= 撤销 / 重做 / 层次 ================= */
-  $('btnUndo').addEventListener('click', function () { send({ type: 'undo' }); });
-  $('btnRedo').addEventListener('click', function () { send({ type: 'redo' }); });
+  /* 撤销/重做：PS 式单条操作时间线（与服务器同一模型）。加入时获取全部时间线（history/historyIndex），
+   * 本地立即逆应用/正应用操作并渲染，不再等待服务器返回数据（服务器仅做权威存储与广播校正） */
+  function updateUndoRedoBtns() {
+    undoable = localHistoryIndex >= 0;
+    redoable = localHistoryIndex < localHistory.length - 1;
+    var u = $('btnUndo'), r = $('btnRedo');
+    u.textContent = '撤销';
+    r.textContent = '重做';
+    u.className = (undoable ? '' : ' disabled') + (u.className.indexOf('hidden') >= 0 ? ' hidden' : '');
+    r.className = (redoable ? '' : ' disabled') + (r.className.indexOf('hidden') >= 0 ? ' hidden' : '');
+  }
+  function doUndo() {
+    if (readonly || localHistoryIndex < 0) return;
+    applyHistoryOp(localHistory[localHistoryIndex], true); // 逆应用指针处操作
+    localHistoryIndex--;
+    updateUndoRedoBtns();
+    render();
+    send({ type: 'undo' }); // 服务器同步权威时间线并广播给其他成员
+  }
+  function doRedo() {
+    if (readonly || localHistoryIndex >= localHistory.length - 1) return;
+    localHistoryIndex++;
+    applyHistoryOp(localHistory[localHistoryIndex], false); // 正应用下一条操作
+    updateUndoRedoBtns();
+    render();
+    send({ type: 'redo' });
+  }
+  $('btnUndo').addEventListener('click', doUndo);
+  $('btnRedo').addEventListener('click', doRedo);
   $('btnToFront').addEventListener('click', function () { if (selectedId) reorderLocal(selectedId, 'toFront', false); });
   $('btnForward').addEventListener('click', function () { if (selectedId) reorderLocal(selectedId, 'forward', false); });
   $('btnBackward').addEventListener('click', function () { if (selectedId) reorderLocal(selectedId, 'backward', false); });
@@ -987,13 +1206,16 @@
   function reorderLocal(id, action, isRemote) {
     var idx = indexOfId(elements, id);
     if (idx < 0) return;
-    var el = elements.splice(idx, 1)[0];
+    var el = elements[idx];
     var ni = idx;
-    if (action === 'toFront') ni = elements.length;
+    if (action === 'toFront') ni = elements.length - 1;
     else if (action === 'toBack') ni = 0;
-    else if (action === 'forward') ni = Math.min(elements.length, idx + 1);
+    else if (action === 'forward') ni = Math.min(elements.length - 1, idx + 1);
     else if (action === 'backward') ni = Math.max(0, idx - 1);
-    else { elements.splice(idx, 0, el); return; }
+    else return;
+    if (ni === idx) return; // 已在目标层次：无变化，不记录时间线
+    localPush({ t: 'ord', id: id, from: idx, to: ni }); // 镜像时间线：重排操作
+    elements.splice(idx, 1);
     elements.splice(ni, 0, el);
     if (!isRemote) send({ type: 'reorder', id: id, action: action });
     render();
@@ -1287,6 +1509,10 @@
       lastStyleSend = t;
     }
     for (var s = 0; s < sends.length; s++) {
+      if (commit && styleUndo[sends[s].id]) {
+        var suEl = getElementById(sends[s].id);
+        localPush({ t: 'upd', id: sends[s].id, before: styleUndo[sends[s].id], after: deepCopy(suEl) });
+      }
       send({ type: 'update', id: sends[s].id, patch: sends[s].patch, commit: commit,
         undo: commit ? (styleUndo[sends[s].id] || null) : undefined });
     }
@@ -1330,6 +1556,10 @@
       lastStyleSend = t;
     }
     for (var s = 0; s < sends.length; s++) {
+      if (commit && styleUndo[sends[s].id]) {
+        var suEl = getElementById(sends[s].id);
+        localPush({ t: 'upd', id: sends[s].id, before: styleUndo[sends[s].id], after: deepCopy(suEl) });
+      }
       send({ type: 'update', id: sends[s].id, patch: sends[s].patch, commit: commit,
         undo: commit ? (styleUndo[sends[s].id] || null) : undefined });
     }
@@ -1423,7 +1653,8 @@
     } else {
       $('presentActions').classList.add('hidden');
     }
-    setStatus(on ? '已隐藏所有工具栏，按 Esc 或点「显示工具栏」恢复' : '');
+    // 退出隐藏工具栏后恢复左下角工具提示（原实现清空导致提示变空文本）
+    setStatus(on ? '已隐藏所有工具栏，按 Esc 或点「显示工具栏」恢复' : (TOOL_HINTS[tool] || ''));
     render();
   }
   $('btnFullscreen').addEventListener('click', function () { setPresent(!inPresent()); });
@@ -1586,11 +1817,17 @@
     var w = screenToWorld(sx, sy);
 
     if (tool === 'laser') {
+      if (noLaser) return; // 房间禁用激光笔（防御：服务端同样忽略）
       drag = { mode: 'laser' };
       // 再次点击：立即清掉本地残留轨迹（远端用户的轨迹由广播消息中的 active 跳变清除）
-      var lme = laserUsers[myUid];
-      if (lme) lme.trail.length = 0;
+      localLaser(w.x, w.y, true);
       sendLaser(w.x, w.y, true);
+      return;
+    }
+    if (tool === 'eraser') {
+      // 橡皮擦模式：点击处命中图案即被擦除
+      var h3 = hitTest(w.x, w.y);
+      if (h3) { eraseElement(h3.id); setStatus('已擦除 1 个图案'); }
       return;
     }
     if (readonly && tool !== 'hand' && tool !== 'select') return;
@@ -1609,7 +1846,8 @@
           return;
         }
         if (ghh === 'rotate') {
-          drag = { mode: 'rotate', group: true, ids: selectedIds.slice(), snaps: snapGroup(), sx: sx, sy: sy, click: true, baseAng: Math.atan2(sy - gh.center.y, sx - gh.center.x) };
+          var gcw = screenToWorld(gh.center.x, gh.center.y);
+          drag = { mode: 'rotate', group: true, ids: selectedIds.slice(), snaps: snapGroup(), sx: sx, sy: sy, cx: gcw.x, cy: gcw.y, click: true, baseAng: Math.atan2(sy - gh.center.y, sx - gh.center.x) };
           return;
         }
       }
@@ -1624,7 +1862,7 @@
           }
           if (h === 'rotate') {
             var c1 = elCenter(sel), sc1 = worldToScreen(c1.x, c1.y);
-            drag = { mode: 'rotate', id: sel.id, sx: sx, sy: sy, click: true, baseAng: Math.atan2(sy - sc1.y, sx - sc1.x), undo: deepCopy(sel) };
+            drag = { mode: 'rotate', id: sel.id, sx: sx, sy: sy, cx: c1.x, cy: c1.y, click: true, baseAng: Math.atan2(sy - sc1.y, sx - sc1.x), undo: deepCopy(sel) };
             return;
           }
         }
@@ -1633,7 +1871,7 @@
       if (selectedIds.length === 1 && selectedId) {
         var s1 = getElementById(selectedId);
         if (s1 && inEditBox(w.x, w.y, s1)) {
-          if (!readonly) drag = { mode: 'move', id: s1.id, undo: deepCopy(s1) };
+          if (!readonly) drag = { mode: 'move', id: s1.id, undo: deepCopy(s1), moved: false };
           return;
         }
       }
@@ -1642,7 +1880,7 @@
         var gb = groupWorldBox();
         if (w.x >= gb.x - gb.w / 2 && w.x <= gb.x + gb.w / 2 &&
             w.y >= gb.y - gb.h / 2 && w.y <= gb.y + gb.h / 2) {
-          drag = { mode: 'move', group: true, ids: selectedIds.slice(), snaps: snapGroup() };
+          drag = { mode: 'move', group: true, ids: selectedIds.slice(), snaps: snapGroup(), moved: false };
           return;
         }
       }
@@ -1650,14 +1888,16 @@
       if (el) {
         // 点中组内元素 → 移动整个组；点中组外元素 → 单选并移动
         if (selectedIds.indexOf(el.id) >= 0 && selectedIds.length > 1) {
-          drag = { mode: 'move', group: true, ids: selectedIds.slice(), snaps: snapGroup() };
+          drag = { mode: 'move', group: true, ids: selectedIds.slice(), snaps: snapGroup(), moved: false };
         } else {
           setSelection(el.id);
-          if (!readonly) drag = { mode: 'move', id: el.id, undo: deepCopy(el) };
+          if (!readonly) drag = { mode: 'move', id: el.id, undo: deepCopy(el), moved: false };
         }
       } else {
-        // 空白处：清空选择并开始框选（未拖动则保持无选择）
-        setSelection(null);
+        // 空白处：清空选择并开始框选（未拖动则保持无选择）；
+        // 未选中时点击空白不发空 sel 广播，仅本地保持无选择
+        if (selectedIds.length) setSelection(null);
+        else setSelection(null, true);
         drag = { mode: 'marquee', x0: sx, y0: sy, wx0: w.x, wy0: w.y, moved: false };
       }
       return;
@@ -1666,7 +1906,7 @@
     if (tool === 'pen') {
       var penEl = { id: uid(), type: 'pen', points: [[w.x, w.y]], stroke: strokeColor, strokeWidth: strokeWidth, opacity: opacity };
       elements.push(penEl);
-      setSelection(null);
+      setSelection(null, true); // 创建图案时静默清空选择，不广播空 sel
       drag = { mode: 'pen', el: penEl, undo: deepCopy(penEl) };
       sendAddLive(penEl); // 创建过程实时显示给访问者（live 不记录撤销，完成时统一提交）
       render();
@@ -1675,7 +1915,7 @@
     if (tool === 'line' || tool === 'arrow') {
       var lnEl = { id: uid(), type: tool, x1: w.x, y1: w.y, x2: w.x, y2: w.y, stroke: strokeColor, strokeWidth: strokeWidth, opacity: opacity };
       elements.push(lnEl);
-      setSelection(null);
+      setSelection(null, true);
       drag = { mode: 'line', el: lnEl, undo: deepCopy(lnEl) };
       sendAddLive(lnEl);
       render();
@@ -1684,7 +1924,7 @@
     if (tool === 'rect' || tool === 'circle') {
       var shEl = { id: uid(), type: tool, x: w.x, y: w.y, w: 0, h: 0, stroke: strokeColor, strokeWidth: strokeWidth, opacity: opacity, fill: (fillColor && fillColor !== 'none') ? fillColor : 'none', rotation: 0 };
       elements.push(shEl);
-      setSelection(null);
+      setSelection(null, true);
       drag = { mode: 'rect', el: shEl, wx0: w.x, wy0: w.y, undo: deepCopy(shEl) };
       sendAddLive(shEl);
       render();
@@ -1696,11 +1936,16 @@
       if (h2) applyBucket(h2);
       return;
     }
-    if (tool === 'image') { showImgModal(); return; }
+    if (tool === 'image') { openImgPicker(); return; }
   }
 
   function onMove(sx, sy) {
     var w = screenToWorld(sx, sy);
+    // 橡皮擦模式：持续记录光标位置（无 drag 时也要渲染半透明橡皮方块）
+    if (tool === 'eraser' && !readonly) {
+      eraserCursor = { x: sx, y: sy };
+      requestRender();
+    }
     if (!drag) return;
     var d = drag;
 
@@ -1732,6 +1977,7 @@
       return;
     }
     if (d.mode === 'move') {
+      d.moved = true; // 有实际移动事件才在松开时提交 update（纯点击选中不发 commit，避免污染撤销栈）
       var dx = (sx - lastPointer.x) / view.zoom;
       var dy = (sy - lastPointer.y) / view.zoom;
       if (d.group) {
@@ -1753,6 +1999,7 @@
       return;
     }
     if (d.mode === 'laser') {
+      localLaser(w.x, w.y, true);
       sendLaser(w.x, w.y, true);
       return;
     }
@@ -1763,6 +2010,13 @@
     var d = drag;
     drag = null;
     if (d.mode === 'pen' || d.mode === 'line') {
+      if (d.el.type === 'pen') {
+        for (var pi = 0; pi < d.el.points.length; pi++) {
+          d.el.points[pi][0] = round2(d.el.points[pi][0]); d.el.points[pi][1] = round2(d.el.points[pi][1]);
+        }
+      } else {
+        d.el.x1 = round2(d.el.x1); d.el.y1 = round2(d.el.y1); d.el.x2 = round2(d.el.x2); d.el.y2 = round2(d.el.y2);
+      }
       sendUpdateCommit(d.el.id, d.undo);
       origShapes[d.el.id] = deepCopy(d.el); // 本地绘制完成即记录初始几何，供复位恢复原始形状
     }
@@ -1772,6 +2026,7 @@
         var ms = Math.max(8, (d.el.strokeWidth || 4) * 2);
         d.el.w = ms; d.el.h = ms;
       }
+      d.el.x = round2(d.el.x); d.el.y = round2(d.el.y); d.el.w = round2(d.el.w); d.el.h = round2(d.el.h);
       sendUpdateCommit(d.el.id, d.undo);
       origShapes[d.el.id] = deepCopy(d.el);
     }
@@ -1812,6 +2067,8 @@
       render();
     }
     else if (d.mode === 'move') {
+      // 纯点击选中（无移动）：不发送 update commit（只发过 sel），避免污染撤销栈
+      if (!d.moved) { render(); return; }
       // 组移动：逐元素提交（携带各自按下时快照供撤销）
       if (d.group) {
         for (var mi = 0; mi < d.ids.length; mi++) {
@@ -1845,7 +2102,7 @@
         sendUpdateCommit(d.id, d.undo);
       }
     }
-    else if (d.mode === 'laser') sendLaser(0, 0, false);
+    else if (d.mode === 'laser') { localLaser(0, 0, false); sendLaser(0, 0, false); }
     render();
   }
 
@@ -1865,7 +2122,7 @@
       var nx2 = mx + Math.cos(origAng) * origLen / 2, ny2 = my + Math.sin(origAng) * origLen / 2;
       if (Math.abs(nx1 - rel.x1) > 0.01 || Math.abs(ny1 - rel.y1) > 0.01 ||
           Math.abs(nx2 - rel.x2) > 0.01 || Math.abs(ny2 - rel.y2) > 0.01) {
-        rel.x1 = nx1; rel.y1 = ny1; rel.x2 = nx2; rel.y2 = ny2;
+        rel.x1 = round2(nx1); rel.y1 = round2(ny1); rel.x2 = round2(nx2); rel.y2 = round2(ny2);
         changed = true;
       }
     } else if (rel.type === 'pen') {
@@ -1879,8 +2136,8 @@
         var rad = delta * Math.PI / 180, cos = Math.cos(rad), sin = Math.sin(rad);
         for (var i = 0; i < rel.points.length; i++) {
           var dx = rel.points[i][0] - cx, dy = rel.points[i][1] - cy;
-          rel.points[i][0] = cx + dx * cos - dy * sin;
-          rel.points[i][1] = cy + dx * sin + dy * cos;
+          rel.points[i][0] = round2(cx + dx * cos - dy * sin);
+          rel.points[i][1] = round2(cy + dx * sin + dy * cos);
         }
         changed = true;
       }
@@ -1889,18 +2146,18 @@
       if (Math.abs(f - 1) > 0.001) {
         var cx2 = cb2.x, cy2 = cb2.y;
         for (var i2 = 0; i2 < rel.points.length; i2++) {
-          rel.points[i2][0] = cx2 + (rel.points[i2][0] - cx2) * f;
-          rel.points[i2][1] = cy2 + (rel.points[i2][1] - cy2) * f;
+          rel.points[i2][0] = round2(cx2 + (rel.points[i2][0] - cx2) * f);
+          rel.points[i2][1] = round2(cy2 + (rel.points[i2][1] - cy2) * f);
         }
         changed = true;
       }
     } else {
       // 矩形/圆形/文本/图片：恢复原始尺寸（宽高/字号）+ 原始旋转角度，当前位置（x/y）不变
-      if (typeof rel.w === 'number' && o.w && Math.abs(rel.w - o.w) > 0.01) { rel.w = o.w; changed = true; }
-      if (typeof rel.h === 'number' && o.h && Math.abs(rel.h - o.h) > 0.01) { rel.h = o.h; changed = true; }
+      if (typeof rel.w === 'number' && o.w && Math.abs(rel.w - o.w) > 0.01) { rel.w = round2(o.w); changed = true; }
+      if (typeof rel.h === 'number' && o.h && Math.abs(rel.h - o.h) > 0.01) { rel.h = round2(o.h); changed = true; }
       if (rel.type === 'text' && o.fontSize && rel.fontSize !== o.fontSize) { rel.fontSize = o.fontSize; changed = true; }
       var origRot = o.rotation || 0;
-      if (Math.abs((rel.rotation || 0) - origRot) > 0.01) { rel.rotation = origRot; changed = true; }
+      if (Math.abs((rel.rotation || 0) - origRot) > 0.01) { rel.rotation = round2(origRot); changed = true; }
     }
     return changed;
   }
@@ -1924,18 +2181,19 @@
 
   /* ================= 具体操作 ================= */
   var TYPE_NAMES = { pen: '画笔', line: '直线', arrow: '箭头', rect: '矩形', circle: '圆形', text: '文本', image: '图片' };
-  function setSelection(id) {
-    setSelectionMulti(id ? [id] : []);
+  function setSelection(id, skipSend) {
+    setSelectionMulti(id ? [id] : [], skipSend);
   }
-  /* 设置多选集合：ids 有序，最后一位为主选中 */
-  function setSelectionMulti(ids) {
+  /* 设置多选集合：ids 有序，最后一位为主选中；skipSend=true 时不广播（切换工具清空选择用） */
+  function setSelectionMulti(ids, skipSend) {
     selectedIds = ids.slice();
     selectedId = selectedIds.length ? selectedIds[selectedIds.length - 1] : null;
     styleUndo = {}; // 样式调整撤销快照随选择变化重置
     updateSelInfo();
     syncPanelFromSelection();
+    updateCopyBtn();
     // 广播选中状态（含全部选中 id），让其他成员（含访问者）看到编辑状态
-    if (connected && myUid) send({ type: 'sel', ids: selectedIds.slice() });
+    if (!skipSend && connected && myUid) send({ type: 'sel', ids: selectedIds.slice() });
     render();
   }
   /* 刷新属性面板「当前图案」文案（选中/未选中/多选数量） */
@@ -1967,12 +2225,12 @@
     if (!el) return;
     if (el.type === 'pen') {
       for (var i = 0; i < el.points.length; i++) {
-        el.points[i][0] += dx; el.points[i][1] += dy;
+        el.points[i][0] = round2(el.points[i][0] + dx); el.points[i][1] = round2(el.points[i][1] + dy);
       }
     } else if (el.type === 'line' || el.type === 'arrow') {
-      el.x1 += dx; el.y1 += dy; el.x2 += dx; el.y2 += dy;
+      el.x1 = round2(el.x1 + dx); el.y1 = round2(el.y1 + dy); el.x2 = round2(el.x2 + dx); el.y2 = round2(el.y2 + dy);
     } else {
-      el.x += dx; el.y += dy;
+      el.x = round2(el.x + dx); el.y = round2(el.y + dy);
     }
     render();
   }
@@ -2023,17 +2281,17 @@
   function scaleElAbout(el, base, ax, ay, f) {
     if (el.type === 'line' || el.type === 'arrow') {
       // 两端点统一绕锚角等比缩放（方向保持不变，被拖角点跟随鼠标）
-      el.x1 = ax + (base.x1 - ax) * f;
-      el.y1 = ay + (base.y1 - ay) * f;
-      el.x2 = ax + (base.x2 - ax) * f;
-      el.y2 = ay + (base.y2 - ay) * f;
+      el.x1 = round2(ax + (base.x1 - ax) * f);
+      el.y1 = round2(ay + (base.y1 - ay) * f);
+      el.x2 = round2(ax + (base.x2 - ax) * f);
+      el.y2 = round2(ay + (base.y2 - ay) * f);
       return true;
     } else if (el.type === 'pen') {
       // 画笔绕锚角等比缩放（被拖角点跟随鼠标）
       var baseP = (base && base.points) ? base.points : el.points;
       for (var i = 0; i < el.points.length; i++) {
-        el.points[i][0] = ax + (baseP[i][0] - ax) * f;
-        el.points[i][1] = ay + (baseP[i][1] - ay) * f;
+        el.points[i][0] = round2(ax + (baseP[i][0] - ax) * f);
+        el.points[i][1] = round2(ay + (baseP[i][1] - ay) * f);
       }
       return true;
     }
@@ -2046,10 +2304,10 @@
       var fMin = 6 / baseFs, fMax = 400 / baseFs;
       if (f < fMin || f > fMax) return false;
     }
-    el.x = ax + (base.x - ax) * f;
-    el.y = ay + (base.y - ay) * f;
-    el.w = baseW * f;
-    el.h = baseH * f;
+    el.x = round2(ax + (base.x - ax) * f);
+    el.y = round2(ay + (base.y - ay) * f);
+    el.w = round2(baseW * f);
+    el.h = round2(baseH * f);
     if (el.type === 'text') {
       el.fontSize = clamp(Math.round(baseFs * f), 6, 400);
     }
@@ -2059,7 +2317,8 @@
   function doRotate(d, sx, sy) {
     if (dist2(sx, sy, d.sx, d.sy) > 25) d.click = false; // 发生真实拖动则不算单击
     if (d.group) {
-      var gc = groupWorldBox();
+      // 旋转中心锁定为按下时的组框中心，避免旋转中包围盒漂移导致角度基准错乱
+      var gc = { x: d.cx, y: d.cy };
       var gsc = worldToScreen(gc.x, gc.y);
       var a1 = Math.atan2(sy - gsc.y, sx - gsc.x);
       var delta = (a1 - d.baseAng) * 180 / Math.PI;
@@ -2075,48 +2334,56 @@
     }
     var el = getElementById(d.id);
     if (!el) return;
-    var c = elCenter(el);
+    // 旋转中心锁定为按下时元素的中心（画笔包围盒中心/文本包围盒中心等）
+    var c = { x: d.cx, y: d.cy };
     var sc = worldToScreen(c.x, c.y);
     var a2 = Math.atan2(sy - sc.y, sx - sc.x);
     var delta2 = (a2 - d.baseAng) * 180 / Math.PI;
     d.baseAng = a2;
     var rad2 = delta2 * Math.PI / 180, cos2 = Math.cos(rad2), sin2 = Math.sin(rad2);
-    rotateElAbout(el, c.x, c.y, cos2, sin2, delta2);
+    if (el.type === 'text') {
+      // 文本 x/y 为左上角、渲染时绕包围盒中心旋转：单选旋转保持中心不动，仅累加角度
+      el.rotation = round2(((el.rotation || 0) + delta2) % 360);
+    } else {
+      rotateElAbout(el, c.x, c.y, cos2, sin2, delta2);
+    }
     throttleSendUpdate(el.id, false);
     render();
   }
 
-  /* 单个元素绕世界坐标 (cx,cy) 旋转 delta 度（cos/sin 已预计算） */
+  /* 单个元素绕世界坐标 (cx,cy) 旋转 delta 度（cos/sin 已预计算）；坐标保留 2 位小数 */
   function rotateElAbout(el, cx, cy, cos, sin, delta) {
     if (el.type === 'line' || el.type === 'arrow') {
       var dx1 = el.x1 - cx, dy1 = el.y1 - cy;
-      el.x1 = cx + dx1 * cos - dy1 * sin;
-      el.y1 = cy + dx1 * sin + dy1 * cos;
+      el.x1 = round2(cx + dx1 * cos - dy1 * sin);
+      el.y1 = round2(cy + dx1 * sin + dy1 * cos);
       var dx2 = el.x2 - cx, dy2 = el.y2 - cy;
-      el.x2 = cx + dx2 * cos - dy2 * sin;
-      el.y2 = cy + dx2 * sin + dy2 * cos;
+      el.x2 = round2(cx + dx2 * cos - dy2 * sin);
+      el.y2 = round2(cy + dx2 * sin + dy2 * cos);
     } else if (el.type === 'pen') {
       for (var i = 0; i < el.points.length; i++) {
         var dx = el.points[i][0] - cx, dy = el.points[i][1] - cy;
-        el.points[i][0] = cx + dx * cos - dy * sin;
-        el.points[i][1] = cy + dx * sin + dy * cos;
+        el.points[i][0] = round2(cx + dx * cos - dy * sin);
+        el.points[i][1] = round2(cy + dx * sin + dy * cos);
       }
     } else {
       var dxb = el.x - cx, dyb = el.y - cy;
-      el.x = cx + dxb * cos - dyb * sin;
-      el.y = cy + dxb * sin + dyb * cos;
-      el.rotation = ((el.rotation || 0) + delta) % 360;
+      el.x = round2(cx + dxb * cos - dyb * sin);
+      el.y = round2(cy + dxb * sin + dyb * cos);
+      el.rotation = round2(((el.rotation || 0) + delta) % 360);
     }
   }
 
   function eraseElement(id) {
     var idx = indexOfId(elements, id);
     if (idx < 0) return;
+    localPush({ t: 'del', el: deepCopy(elements[idx]), i: idx }); // 镜像时间线：删除操作（含原位置，供撤销恢复）
     elements.splice(idx, 1);
     var si = selectedIds.indexOf(id);
     if (si >= 0) selectedIds.splice(si, 1);
     if (selectedId === id) selectedId = selectedIds.length ? selectedIds[selectedIds.length - 1] : null;
     updateSelInfo();
+    updateCopyBtn();
     send({ type: 'delete', id: id });
     render();
   }
@@ -2184,8 +2451,10 @@
     else if (el.type === 'image') { patch.opacity = opacity; } // 图片无填充/描边色，油漆桶应用当前透明度
     else return;
     patch.opacity = opacity;
+    var bucketBefore = deepCopy(el); // 修改前元素（时间线 upd 的 before，与服务器普通 commit 语义一致）
     var k;
     for (k in patch) { if (patch.hasOwnProperty(k)) el[k] = patch[k]; }
+    localPush({ t: 'upd', id: el.id, before: bucketBefore, after: deepCopy(el) });
     send({ type: 'update', id: el.id, patch: patch, commit: true });
     render();
   }
@@ -2194,6 +2463,7 @@
     if (readonly) return;
     if (!elements.length) { setStatus('画布本来就是空的'); return; }
     if (confirm('确定要清空整个画布吗？此操作可撤销。')) {
+      localPush({ t: 'clear', els: deepCopy(elements) }); // 镜像时间线：清空操作（清空前全量，仅此一次）
       elements = [];
       selectedId = null;
       selectedIds = [];
@@ -2203,9 +2473,16 @@
   }
 
   /* ================= 发送辅助 ================= */
-  function sendAdd(el) { send({ type: 'add', element: el }); }
+  function sendAdd(el) {
+    // 镜像时间线：add 操作（与服务器 pushHistoryOp 语义一致）
+    localPush({ t: 'add', el: el, i: indexOfId(elements, el.id) });
+    send({ type: 'add', element: el });
+  }
   /* 创建过程的实时预览广播：服务端不记录撤销历史（完成时统一 commit），访问者实时看到绘制过程 */
-  function sendAddLive(el) { send({ type: 'add', element: el, live: true }); }
+  function sendAddLive(el) {
+    localLive[el.id] = true;
+    send({ type: 'add', element: el, live: true });
+  }
 
   function geometryPatch(el) {
     if (el.type === 'pen') return { points: el.points.slice(0) };
@@ -2239,6 +2516,17 @@
   function sendUpdateCommit(id, undoEl) {
     var el = getElementById(id);
     if (!el) return;
+    if (localLive[id]) {
+      // 绘制完成（live 创建 → 首次 commit）：时间线记录为「该元素从无到有」（add）
+      localPush({ t: 'add', el: deepCopy(el), i: indexOfId(elements, id) });
+      delete localLive[id];
+    } else if (undoEl) {
+      // 拖动/变换完成：时间线记录为 upd（before = 拖动起点状态）
+      localPush({ t: 'upd', id: id, before: undoEl, after: deepCopy(el) });
+    } else {
+      // 兜底：无起点快照时以当前状态为 before（服务器普通 commit 语义近似）
+      localPush({ t: 'upd', id: id, before: deepCopy(el), after: deepCopy(el) });
+    }
     var msg = { type: 'update', id: id, patch: geometryPatch(el), commit: true };
     if (undoEl) msg.undo = undoEl;
     send(msg);
@@ -2249,16 +2537,30 @@
     lastLaserSend = t;
     send({ type: 'laser', x: x, y: y, active: active });
   }
+  /* 本地激光笔轨迹：服务器不回传发起者，自己发送的轨迹由本地直接渲染 */
+  function localLaser(x, y, active) {
+    var lu = laserUsers[myUid];
+    if (!lu) { lu = { x: 0, y: 0, active: false, trail: [] }; laserUsers[myUid] = lu; }
+    // 从「松开」再次「按下」：立即清掉上一次残留轨迹；松开时不清空，让轨迹继续渐隐
+    if (active && !lu.active) lu.trail.length = 0;
+    lu.x = x; lu.y = y; lu.active = active;
+    if (active) {
+      lu.trail.push({ x: x, y: y, t: Date.now() });
+      if (lu.trail.length > 40) lu.trail.shift();
+    }
+    scheduleLaserFade();
+    requestRender();
+  }
 
   /* ================= 文本工具（点击画布后就地输入，不弹窗；输入框可拖拽移动；兼容 iOS9） ================= */
   var inlineActive = false; // 内联文本编辑中
-  var inlinePos = null;     // {sx, sy} 输入框屏幕坐标（可被拖拽更新，提交时换算世界坐标）
   var inlineEditId = null;  // 双击编辑已有文本时记录其 id（null = 新建）
+  var inlineDragged = false; // 输入框是否被用户实际拖拽移动过（未拖拽时编辑保持原位置/旋转）
   function startInlineText(wx, wy, editEl) {
     var ta = $('inlineText');
     var s = worldToScreen(wx, wy);
-    inlinePos = { sx: s.x, sy: s.y };
     inlineEditId = editEl ? editEl.id : null;
+    inlineDragged = false;
     // 输入框左上角对准点击点（最终渲染文本以输入框内文字起点为准），实现"输入在哪显示在哪"
     ta.style.left = Math.max(8, Math.min(s.x, window.innerWidth - 180 - 12)) + 'px';
     ta.style.top = Math.max(0, s.y) + 'px';
@@ -2298,14 +2600,13 @@
     }
     var h = totalLines * fs * 1.3 + 6;
     ta.style.height = h + 'px';
-    // 防止随内容增长超出视口：右/下缘回拉，并同步提交位置
+    // 防止随内容增长超出视口：右/下缘回拉
     var l = parseFloat(ta.style.left) || 0, tp = parseFloat(ta.style.top) || 0;
     var nl = Math.max(0, Math.min(l, window.innerWidth - 8 - w));
     var nt = Math.max(0, Math.min(tp, window.innerHeight - 8 - h));
     if (nl !== l || nt !== tp) {
       ta.style.left = nl + 'px';
       ta.style.top = nt + 'px';
-      inlinePos = { sx: nl, sy: nt };
     }
   }
   /* 提交内联文本：非空则创建/更新文本元素并广播（位置 = 输入框内文字起点，与输入时所见一致）；
@@ -2327,7 +2628,6 @@
     var l = parseFloat(ta.style.left) || 0, tp = parseFloat(ta.style.top) || 0;
     var wpt = screenToWorld(l + 6, tp + 2 + Math.round(fs * 0.15));
     var wx = wpt.x, wy = wpt.y;
-    inlinePos = null;
     if (editId) {
       var el = getElementById(editId);
       if (!el) return;
@@ -2342,10 +2642,14 @@
       }
       el.text = val;
       el.fontSize = fs;
-      el.x = wx; el.y = wy;
+      // 仅当输入框被实际拖拽移动过才更新位置（输入框内文字起点）；否则保持原有坐标，
+      // 避免编辑后坐标向右下漂移（输入框内边距/行内偏移被当成新原点）
+      if (inlineDragged) { el.x = wx; el.y = wy; }
       el.w = maxW + 2; el.h = lines.length * fs * 1.3;
-      el.rotation = 0; // 编辑后按输入框位置重新排布
+      // 保留原有旋转角度，编辑不改变方向
+      el.rotation = el.rotation || 0;
       origShapes[el.id] = deepCopy(el); // 更新初始几何，复位恢复本次编辑后的状态
+      inlineDragged = false;
       sendUpdateCommit(el.id, undo);
       setSelection(el.id);
       render();
@@ -2368,15 +2672,15 @@
     elements.push(el);
     sendAdd(el);
     origShapes[el.id] = deepCopy(el); // 文本创建即记录初始尺寸，供复位恢复原始字号/宽高
-    setSelection(null);
+    setSelection(null, true);
     render();
   }
   function cancelInlineText() {
     if (!inlineActive) return;
     inlineActive = false;
     inlineEditId = null;
+    inlineDragged = false;
     $('inlineText').classList.add('hidden');
-    inlinePos = null;
   }
   var inlineTextTa = $('inlineText');
   inlineTextTa.addEventListener('blur', function () { commitInlineText(); }, false);
@@ -2403,14 +2707,13 @@
   function inlineDragMove(cx, cy) {
     if (!inlineDrag) return;
     var dx = cx - inlineDrag.sx, dy = cy - inlineDrag.sy;
-    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) inlineDrag.moved = true;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) { inlineDrag.moved = true; inlineDragged = true; }
     if (!inlineDrag.moved) return;
     var ta = $('inlineText');
     var nl = Math.max(0, Math.min(inlineDrag.l + dx, window.innerWidth - 50));
     var nt = Math.max(0, inlineDrag.t + dy);
     ta.style.left = nl + 'px';
     ta.style.top = nt + 'px';
-    inlinePos = { sx: nl, sy: nt }; // 同步提交位置
   }
   function inlineDragEnd() { inlineDrag = null; }
   inlineTextTa.addEventListener('mousedown', function (e) {
@@ -2433,22 +2736,18 @@
   }, { passive: false });
   inlineTextTa.addEventListener('touchend', inlineDragEnd, false);
 
-  /* ================= 图片工具（仅从相册选择，压缩后插入） ================= */
-  function showImgModal() {
+  /* ================= 图片工具（点选后直接打开系统文件选择，压缩后插入） ================= */
+  function openImgPicker() {
     if (readonly) return;
     $('imgFile').value = '';
-    $('imgModal').classList.remove('hidden');
+    $('imgFile').click(); // 像导入配置一样直接触发文件选择，不再经弹窗
   }
-  function hideImgModal() { $('imgModal').classList.add('hidden'); }
-  $('btnCloseImg').addEventListener('click', hideImgModal);
-  $('imgModal').addEventListener('click', function (e) {
-    if (e.target === this) hideImgModal();
-  }, false);
   $('imgFile').addEventListener('change', function () {
     var f = this.files && this.files[0];
     if (!f) return;
+    this.value = ''; // 允许再次选择同一文件
     var r = new FileReader();
-    r.onload = function () { hideImgModal(); insertImage(String(r.result)); };
+    r.onload = function () { insertImage(String(r.result)); };
     r.onerror = function () { alert('读取文件失败'); };
     r.readAsDataURL(f);
   });
@@ -2470,15 +2769,19 @@
       var dataUrl = c.toDataURL('image/jpeg', 0.85);
       if (dataUrl.length > 1800000) dataUrl = c.toDataURL('image/jpeg', 0.5);
       var center = screenToWorld(window.innerWidth / 2, window.innerHeight / 2);
+      // 图片数据存入独立图片池（按 imageId 去重，复制图片不重复存储），元素只保留引用
+      var imgId = uid();
+      images.push({ id: imgId, src: dataUrl });
       var el = {
         id: uid(), type: 'image',
         x: center.x, y: center.y, w: cw, h: ch,
-        src: dataUrl, rotation: 0, opacity: opacity
+        imageId: imgId, rotation: 0, opacity: opacity
       };
       elements.push(el);
-      sendAdd(el);
+      send({ type: 'add', element: { id: el.id, type: 'image', imageId: imgId, x: el.x, y: el.y, w: el.w, h: el.h, rotation: 0, opacity: el.opacity, src: dataUrl } });
+      localPush({ t: 'add', el: el, i: indexOfId(elements, el.id) }); // 镜像时间线：add 操作（图片从无到有）
       origShapes[el.id] = deepCopy(el); // 图片插入即记录初始尺寸，供复位恢复原始宽高
-      setSelection(null);
+      setSelection(null, true);
       setTool('select'); // 插入图片后工具返回选择
       render();
     };
@@ -2491,6 +2794,8 @@
     if (!isOwner || !connected) return;
     $('roomNameInput').value = roomInfo.name;
     $('roomPwdInput').value = roomInfo.pwd || '';
+    $('roomNoLaserRO').checked = !!roomInfo.noLaserRO;
+    $('roomForceRO').checked = !!roomInfo.forceRO;
     $('roomModal').classList.remove('hidden');
     try { $('roomNameInput').focus(); } catch (e) {}
   }
@@ -2510,6 +2815,13 @@
     }
     if (p !== (roomInfo.pwd || '')) {
       send({ type: 'pwd_change', pwd: p });
+    }
+    // 房间级策略：只读禁用激光笔 / 可编辑用户禁止编辑（任一有变化才发送，服务端忽略未变化字段）
+    var noLaserRO = !!$('roomNoLaserRO').checked;
+    var forceRO = !!$('roomForceRO').checked;
+    if (noLaserRO !== !!roomInfo.noLaserRO || forceRO !== !!roomInfo.forceRO) {
+      send({ type: 'room_settings', noLaserRO: noLaserRO, forceRO: forceRO });
+      setStatus('已发送房间设置…');
     }
   });
   $('btnRoomCancel').addEventListener('click', function () { $('roomModal').classList.add('hidden'); });
@@ -2588,6 +2900,9 @@
   $('btnExitCancel').addEventListener('click', function () { $('exitModal').classList.add('hidden'); });
   $('btnExitOk').addEventListener('click', function () {
     $('exitModal').classList.add('hidden');
+    // 退出白板：发送退出消息并关闭连接（服务器随即广播 user_left）
+    send({ type: 'bye' });
+    try { ws.close(); } catch (e) {}
     location.href = 'index.html';
   });
   $('exitModal').addEventListener('click', function (e) {
@@ -2643,8 +2958,8 @@
     window.open('data:text/plain;charset=utf-8,' + encodeURIComponent(text), '_blank');
   }
 
-  /* 导出为图片：按全部元素的世界包围盒离屏渲染 PNG（单边不超过 4096） */
-  $('btnExportImg').addEventListener('click', function () {
+  /* 导出为图片（分享弹窗内「导出图片」）：按全部元素的世界包围盒离屏渲染 PNG（单边不超过 4096） */
+  $('btnShareExportImg').addEventListener('click', function () {
     if (!roomInfo) return;
     if (!elements.length) { setStatus('白板为空，无可导出的内容'); return; }
     var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -2682,15 +2997,16 @@
     setStatus('已导出白板图片');
   });
 
-  /* 导出配置（所有成员可用）：把白板元素数据导出为 JSON 文件 */
+  /* 导出配置（所有成员可用）：把白板元素与图片池数据导出为 JSON 文件 */
   $('btnExportCfg').addEventListener('click', function () {
     if (!roomInfo) return;
     var cfg = {
       type: 'shared-whiteboard-config',
-      version: 1,
+      version: 2,
       room: roomInfo.id,
       exportedAt: new Date().toISOString(),
-      elements: elements
+      elements: elements,
+      images: images
     };
     downloadText(JSON.stringify(cfg), '白板配置-' + roomInfo.id + '.json', 'application/json;charset=utf-8');
     setStatus('已导出白板配置');
@@ -2712,7 +3028,11 @@
       var list = cfg && Array.isArray(cfg.elements) ? cfg.elements : null;
       if (!list) { alert('配置文件中没有可导入的白板内容'); return; }
       if (!confirm('导入将覆盖当前白板的全部内容，且无法撤销。确定继续？')) return;
-      send({ type: 'import', elements: list });
+      send({ type: 'import', elements: list, images: Array.isArray(cfg.images) ? cfg.images : [] });
+      // 导入全量替换：清空本地时间线（与服务器一致，导入不可撤销）
+      localHistory = [];
+      localHistoryIndex = -1;
+      updateUndoRedoBtns();
       // 导入配置成功后关闭分享弹窗
       $('shareModal').classList.add('hidden');
       setStatus('正在导入配置…');
@@ -2727,9 +3047,9 @@
     if (ae && (ae.tagName === 'TEXTAREA' || ae.tagName === 'INPUT')) return;
     if (!$('shareModal').classList.contains('hidden')) return;
     var mod = e.ctrlKey || e.metaKey;
-    if (mod && e.keyCode === 90 && !e.shiftKey) { e.preventDefault(); send({ type: 'undo' }); }
-    else if (mod && e.keyCode === 89) { e.preventDefault(); send({ type: 'redo' }); }
-    else if (mod && e.shiftKey && e.keyCode === 90) { e.preventDefault(); send({ type: 'redo' }); }
+    if (mod && e.keyCode === 90 && !e.shiftKey) { e.preventDefault(); doUndo(); }
+    else if (mod && e.keyCode === 89) { e.preventDefault(); doRedo(); }
+    else if (mod && e.shiftKey && e.keyCode === 90) { e.preventDefault(); doRedo(); }
     else if (mod && e.keyCode === 67 && tool === 'select') { e.preventDefault(); copyToBuffer(); }
     else if (mod && e.keyCode === 86 && tool === 'select') { e.preventDefault(); pasteBuffer(); }
     else if ((e.keyCode === 46 || e.keyCode === 8) && selectedIds.length && tool === 'select') {
@@ -2747,9 +3067,10 @@
   // welcome 到达后 applyRoomUI 会按服务端权限权威校正
   $('btnExit').classList.remove('hidden');
   // 只读用户（URL 带 ro=1）：进入页面立即应用只读界面，不先加载全部功能再隐藏；
-  // welcome 到达后 applyRoomUI 按服务端权限权威校正
+  // welcome 到达后 applyRoomUI 按服务端权限权威校正（含房间设置「只读禁用激光笔」）
   if (PARAMS.ro === '1') {
     readonly = true;
+    myBaseRO = true;
     applyReadonlyUI();
   } else {
     setTool('pen');
