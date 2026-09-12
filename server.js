@@ -7,11 +7,11 @@
  * - WebSocket /ws：房间内协同（增删改、撤销重做、层次、激光笔、在线用户、房间设置）
  * - 房间数据（元素、操作时间线、用户、图片池）全部缓存在进程内存，进程重启即清空
  * ============================================================ */
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const url = require('url');
-const crypto = require('crypto');
+const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
+const url = require('node:url');
+const crypto = require('node:crypto');
 const WebSocketServer = require('ws').Server;
 
 const PORT = Number(process.env.PORT) || 8080;
@@ -88,7 +88,7 @@ function roomId() {
   return id;
 }
 function now() { return Date.now(); }
-function isNum(v) { return typeof v === 'number' && isFinite(v); }
+function isNum(v) { return typeof v === 'number' && Number.isFinite(v); }
 
 const USER_COLORS = ['#E53935', '#FB8C00', '#FDD835', '#43A047', '#00897B', '#1E88E5', '#8E24AA', '#F06292', '#6D4C41', '#616161'];
 
@@ -119,7 +119,7 @@ function createRoom(name, pwd, rid) {
 function shareUrl(req, room) {
   const host = req.headers.host || (`localhost:${PORT}`);
   // 协议动态判定：支持 https 反代（x-forwarded-proto）与直连 TLS
-  const proto = (req.connection && req.connection.encrypted) || (req.headers['x-forwarded-proto'] || '').indexOf('https') === 0 ? 'https' : 'http';
+  const proto = (req.connection?.encrypted) || (req.headers['x-forwarded-proto'] || '').indexOf('https') === 0 ? 'https' : 'http';
   let q = `room=${encodeURIComponent(room.id)}`;
   if (room.pwd) q += `&pwd=${encodeURIComponent(room.pwd)}`;
   return `${proto}://${host}/board.html?${q}`;
@@ -201,7 +201,7 @@ function applyHistoryOp(room, op, inverse) {
       Object.keys(snap).forEach((k) => { room.elements[idx][k] = snap[k]; });
     }
   } else if (op.t === 'clear') {
-    if (inverse) room.elements = JSON.parse(JSON.stringify(op.els));
+    if (inverse) room.elements = structuredClone(op.els);
     else room.elements = [];
   } else if (op.t === 'ord') {
     const idx = findIndexById(room, op.id);
@@ -230,7 +230,7 @@ function broadcast(room, msg, exceptUid) {
   Object.keys(room.clients).forEach((uid) => {
     if (uid === exceptUid) return;
     const c = room.clients[uid];
-    if (c.ws && c.ws.readyState === 1) {
+    if (c.ws?.readyState === 1) {
       try { c.ws.send(data); } catch (e) {}
     }
   });
@@ -265,8 +265,8 @@ function validElement(el) {
   if (!ELEMENT_TYPES[el.type]) return false;
   if (el.type === 'pen') {
     if (!Array.isArray(el.points) || el.points.length < 1 || el.points.length > 5000) return false;
-    for (let i = 0; i < el.points.length; i++) {
-      const p = el.points[i];
+    for (const element of el.points) {
+      const p = element
       if (!Array.isArray(p) || p.length < 2 || !isNum(p[0]) || !isNum(p[1])) return false;
     }
   } else if (el.type === 'text') {
@@ -280,8 +280,8 @@ function validElement(el) {
   if (el.opacity !== undefined && (!isNum(el.opacity) || el.opacity < 0 || el.opacity > 1)) return false;
   if (el.strokeWidth !== undefined && (!isNum(el.strokeWidth) || el.strokeWidth < 0.5 || el.strokeWidth > 200)) return false;
   if (el.fontSize !== undefined && (!isNum(el.fontSize) || el.fontSize < 4 || el.fontSize > 500)) return false;
-  if (el.rotation !== undefined && !isNum(el.rotation)) return false;
-  return true;
+  return !(el.rotation !== undefined && !isNum(el.rotation));
+
 }
 
 /* 图片元素归一化：把 src 存入房间图片池（按 imageId 去重），元素只保留 imageId 引用；
@@ -290,9 +290,9 @@ function attachImage(room, el) {
   if (el.type !== 'image') return el;
   let imgId = el.imageId;
   if (imgId) {
-    for (let i = 0; i < room.images.length; i++) {
-      if (room.images[i].id === imgId) {
-        const out = Object.assign({}, el);
+    for (const element of room.images) {
+      if (element.id === imgId) {
+        const out = {...el};
         delete out.src;
         return out; // 图片池已有该图：去重
       }
@@ -303,7 +303,7 @@ function attachImage(room, el) {
   if (typeof el.src !== 'string' || !el.src) return null; // 新图片必须携带数据
   room.images.push({ id: imgId, src: el.src });
   broadcast(room, { type: 'image_added', image: { id: imgId, src: el.src } });
-  const out = Object.assign({}, el);
+  const out = {...el};
   out.imageId = imgId;
   delete out.src;
   return out;
@@ -317,8 +317,8 @@ function sanitizePatch(patch) {
     const v = patch[k];
     if (k === 'points') {
       if (!Array.isArray(v) || v.length > 5000) return;
-      for (let i = 0; i < v.length; i++) {
-        const p = v[i];
+      for (const element of v) {
+        const p = element
         if (!Array.isArray(p) || p.length < 2 || !isNum(p[0]) || !isNum(p[1])) return;
       }
       out[k] = v;
@@ -334,9 +334,7 @@ function sanitizePatch(patch) {
       if (isNum(v) && v > 0 && v <= 200) out[k] = v;
     } else if (k === 'fontSize') {
       if (isNum(v) && v > 0 && v <= 500) out[k] = v;
-    } else {
-      if (isNum(v)) out[k] = v;
-    }
+    } else if (isNum(v)) out[k] = v
   });
   return out;
 }
@@ -351,7 +349,7 @@ function deleteRoom(room) {
   delete rooms[room.id];
   Object.keys(room.clients).forEach((uid) => {
     const c = room.clients[uid];
-    if (c.ws && c.ws.readyState === 1) {
+    if (c.ws?.readyState === 1) {
       try { c.ws.close(); } catch (e) {}
     }
   });
@@ -379,7 +377,7 @@ function handleMessage(room, client, msg) {
     const selIds = [];
     if (Array.isArray(msg.ids)) {
       for (let si = 0; si < msg.ids.length && si < 200; si++) {
-        if (typeof msg.ids[si] === 'string' && msg.ids[si].length <= 40 && selIds.indexOf(msg.ids[si]) < 0) selIds.push(msg.ids[si]);
+        if (typeof msg.ids[si] === 'string' && msg.ids[si].length <= 40 && !selIds.includes(msg.ids[si])) selIds.push(msg.ids[si]);
       }
     } else if (typeof msg.id === 'string' && msg.id.length <= 40) {
       selIds.push(msg.id);
@@ -412,7 +410,7 @@ function handleMessage(room, client, msg) {
       Object.keys(room.clients).forEach((uid) => {
         const c = room.clients[uid];
         if (!c || c.owner) return;
-        if (c.ws && c.ws.readyState === 1) {
+        if (c.ws?.readyState === 1) {
           try { c.ws.send(JSON.stringify({ type: 'pwd_kicked', reason: '访问密码已更改，请重新输入密码加入' })); } catch (e) {}
           setTimeout(() => { try { c.ws.close(); } catch (e) {} }, 200);
         }
@@ -465,16 +463,16 @@ function handleMessage(room, client, msg) {
     const cleanImages = [];
     const imgBy = Object.create(null);
     if (Array.isArray(msg.images)) {
-      for (let ii = 0; ii < msg.images.length; ii++) {
-        const im = msg.images[ii];
+      for (const element of msg.images) {
+        const im = element
         if (im && typeof im.id === 'string' && im.id.length <= 40 && typeof im.src === 'string' && im.src.length <= 2500000) {
           cleanImages.push({ id: im.id, src: im.src });
           imgBy[im.id] = im.src;
         }
       }
     }
-    for (let ei = 0; ei < msg.elements.length; ei++) {
-      const e = msg.elements[ei];
+    for (const element of msg.elements) {
+      const e = element
       if (!validElement(e)) continue;
       if (e.type === 'image') {
         let imgId = e.imageId;
@@ -485,7 +483,7 @@ function handleMessage(room, client, msg) {
           cleanImages.push({ id: imgId, src });
           imgBy[imgId] = src;
         }
-        const el2 = Object.assign({}, e);
+        const el2 = {...e};
         el2.imageId = imgId;
         delete el2.src;
         clean.push(el2);
@@ -557,12 +555,12 @@ function handleMessage(room, client, msg) {
           beforeEl = msg.undo;
           br.undo = msg.undo;
         } else {
-          beforeEl = JSON.parse(JSON.stringify(room.elements[idx])); // 应用 patch 前快照（供远端镜像时间线）
+          beforeEl = structuredClone(room.elements[idx]); // 应用 patch 前快照（供远端镜像时间线）
           br.before = beforeEl;
         }
       }
-      for (let i = 0; i < keys.length; i++) {
-        const k = keys[i];
+      for (const element of keys) {
+        const k = element
         if (k === 'points') {
           room.elements[idx].points = patch[k].map((p) => [p[0], p[1]]);
         } else {
@@ -570,11 +568,11 @@ function handleMessage(room, client, msg) {
         }
       }
       if (msg.commit) {
-        const afterEl = JSON.parse(JSON.stringify(room.elements[idx]));
+        const afterEl = structuredClone(room.elements[idx]);
         if (br.liveDone) {
           pushHistoryOp(room, { t: 'add', el: afterEl, i: idx }); // 元素最终形态作为 add 操作
         } else if (beforeEl) {
-          pushHistoryOp(room, { t: 'upd', id: msg.id, before: JSON.parse(JSON.stringify(beforeEl)), after: afterEl });
+          pushHistoryOp(room, { t: 'upd', id: msg.id, before: structuredClone(beforeEl), after: afterEl });
         }
         broadcastHistory(room);
       }
@@ -597,7 +595,7 @@ function handleMessage(room, client, msg) {
 
     case 'clear':
       if (room.elements.length) {
-        pushHistoryOp(room, { t: 'clear', els: JSON.parse(JSON.stringify(room.elements)) });
+        pushHistoryOp(room, { t: 'clear', els: structuredClone(room.elements) });
         room.elements.length = 0;
         room.livePending = Object.create(null);
         broadcast(room, { type: 'board_cleared' }, client.uid);
@@ -644,7 +642,7 @@ function applyUndoRedo(room, isUndo, exceptUid) {
 }
 
 function sendRaw(client, msg) {
-  if (client.ws && client.ws.readyState === 1) {
+  if (client.ws?.readyState === 1) {
     try { client.ws.send(JSON.stringify(msg)); } catch (e) {}
   }
 }
@@ -727,7 +725,7 @@ const server = http.createServer((req, res) => {
     const rid2 = String(u.query.id || '').trim().toUpperCase();
     const room2 = rooms[rid2];
     // 密码校验规则与 tryJoin 一致：无密码则通过；有密码则需匹配（创建者凭 key 不受限）
-    const pwdOk2 = !room2 || !room2.pwd || (String(u.query.pwd || '') === room2.pwd);
+    const pwdOk2 = !room2?.pwd || (String(u.query.pwd || '') === room2.pwd);
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' });
     res.end(JSON.stringify({ ok: true, exists: !!room2, pwdOk: pwdOk2 }));
     return;
@@ -773,7 +771,7 @@ const server = http.createServer((req, res) => {
     if (!ADMIN_ENABLED) { adminDisabled(res); return; }
     if (!basicAuthOk(req)) { needAuth(res); return; }
     const ids = Object.keys(rooms);
-    for (let ai = 0; ai < ids.length; ai++) deleteRoom(rooms[ids[ai]]);
+    for (const element of ids) deleteRoom(rooms[element]);
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' });
     res.end(JSON.stringify({ ok: true, deleted: ids.length }));
     return;
@@ -868,7 +866,7 @@ wss.on('connection', (ws, req) => {
 });
 
 function roomOf(client) {
-  return client && client._room;
+  return client?._room;
 }
 
 /* 空闲房间自动回收：空白板无访问 1 小时删除；有内容白板无访问或修改 7 天删除（不阻塞进程退出） */
