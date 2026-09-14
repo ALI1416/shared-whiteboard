@@ -2,7 +2,7 @@
 
 HTML5 + Node.js 实现的多人实时协作白板，房间数据全部缓存在服务器内存中，支持 iOS 9 Safari。
 
-预览地址：<https://wb.404z.cn/>
+预览地址：<http://web.404z.cn:9000/>
 
 > **声明**：本项目由豆包 AI 生成，仅供学习与参考。使用过程中出现的任何问题，作者不承担任何责任。
 
@@ -34,15 +34,49 @@ HTML5 + Node.js 实现的多人实时协作白板，房间数据全部缓存在�
 
 服务端使用 Node.js（建议 Node 24+；server.js 与 test/ 无需兼容 iOS 9，仅 public/ 客户端保持 ES5 / iOS 9 兼容）。
 
+使用nvm启动
 ```bash
+# 下载nvm安装脚本
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.7/install.sh | bash
+# 加载环境变量
+source ~/.bashrc
+# 验证nvm
+nvm --version
+# 安装node24，自带npm
+nvm install 24
+# 使用node24作为当前版本
+nvm use 24
+# 设置默认版本（新开终端自动使用node24）
+nvm alias default 24
+# 全局安装pm2
+npm install pm2 -g
+# 校验版本
+node -v
+npm -v
+pm2 -v
+# 打开项目文件夹
 cd shared-whiteboard
-npm install        # 安装依赖（仅 ws + jsdom）
-npm start          # 启动，默认 http://localhost:8080
+# 安装依赖
+npm install
+# 启动
+pm2 start node server.js --name "shared-whiteboard" -- --admin-user=admin --admin-pass=admin --port=9000
+```
+
+使用npm启动
+```bash
+# 打开项目文件夹
+cd shared-whiteboard
+# 安装依赖
+npm install
+# 启动
+node server.js --admin-user=admin --admin-pass=admin --port=9000
 ```
 
 浏览器打开 `http://localhost:8080` 创建或加入房间。手机（iOS 9 及以上）访问时，请用电脑的局域网 IP，例如 `http://192.168.x.x:8080`。
 
-- 支持 `PORT` 环境变量改端口：`PORT=9000 npm start`
+- 支持修改端口号（环境变量或启动参数，二选一）：`PORT=9000 npm start`
+  - 环境变量：`PORT=9000 npm start`
+  - 启动参数：`node server.js --port=9000`
 - 管理员账号（环境变量或启动参数，二选一）：
   - 环境变量：`ADMIN_USER=admin ADMIN_PASS=admin npm start`
   - 启动参数：`node server.js --admin-user=admin --admin-pass=admin`

@@ -14,7 +14,15 @@ const url = require('node:url');
 const crypto = require('node:crypto');
 const WebSocketServer = require('ws').Server;
 
-const PORT = Number(process.env.PORT) || 8080;
+function getArg(name) {
+  const prefix = '--' + name + '=';
+  for (let i = 2; i < process.argv.length; i++) {
+    if (process.argv[i].indexOf(prefix) === 0) return process.argv[i].slice(prefix.length);
+  }
+  return '';
+}
+
+const PORT = Number(process.env.PORT) || getArg('port') || 8080;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_BODY = 1024 * 1024;           // REST 请求体上限 1MB
 const MAX_MSG = 4 * 1024 * 1024;        // WS 单条消息上限 4MB
@@ -25,15 +33,8 @@ const ROOM_TTL_CONTENT_MS = 7 * 24 * 60 * 60 * 1000;  // 有内容白板无访�
 
 /* ---------------- 管理员账号（启动参数配置） ----------------
  * 支持环境变量 ADMIN_USER / ADMIN_PASS，或命令行参数
- *   node server.js --admin-user=admin --admin-pass=secret
+ *   node server.js --admin-user=admin --admin-pass=admin
  * 两者都配置后才启用 /admin 管理页面与 /api/admin/* 接口。 */
-function getArg(name) {
-  const prefix = '--' + name + '=';
-  for (let i = 2; i < process.argv.length; i++) {
-    if (process.argv[i].indexOf(prefix) === 0) return process.argv[i].slice(prefix.length);
-  }
-  return '';
-}
 const ADMIN_USER = process.env.ADMIN_USER || getArg('admin-user') || '';
 const ADMIN_PASS = process.env.ADMIN_PASS || getArg('admin-pass') || '';
 const ADMIN_ENABLED = !!(ADMIN_USER && ADMIN_PASS);
