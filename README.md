@@ -59,7 +59,11 @@ cd shared-whiteboard
 # 安装依赖
 npm install
 # 启动
-pm2 start node server.js --name "shared-whiteboard" -- --admin-user=admin --admin-pass=admin --port=9000
+pm2 start server.js --name "shared-whiteboard" -- --admin-user=admin --admin-pass="admin!" --port=9000
+# pm2开机自启
+pm2 startup
+# 保存配置
+pm2 save
 ```
 
 使用npm启动
